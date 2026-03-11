@@ -14,6 +14,9 @@ public:
     virtual void StartupModule() override;
     virtual void ShutdownModule() override;
 
+    /** Opens the SMS Level Importer Slate window */
+    void OpenImporterWindow();
+
 private:
     /** Registers the Tools menu entry */
     void RegisterMenus();

@@ -1,9 +1,11 @@
 // Copyright ryana. All Rights Reserved.
 
 #include "SMSLevelImporterModule.h"
+#include "UI/SSMSImporterWindow.h"
 #include "ToolMenus.h"
 #include "ToolMenuEntry.h"
 #include "ToolMenuSection.h"
+#include "Framework/Application/SlateApplication.h"
 
 #define LOCTEXT_NAMESPACE "FSMSLevelImporterModule"
 
@@ -42,12 +44,23 @@ void FSMSLevelImporterModule::RegisterMenus()
             LOCTEXT("OpenSMSImporterLabel", "SMS Level Importer"),
             LOCTEXT("OpenSMSImporterTooltip", "Open the Super Mario Sunshine level importer"),
             FSlateIcon(),
-            FUIAction(FExecuteAction::CreateLambda([]()
-            {
-                UE_LOG(LogSMSImporter, Log, TEXT("SMS Importer opened"));
-            }))
+            FUIAction(FExecuteAction::CreateRaw(this, &FSMSLevelImporterModule::OpenImporterWindow))
         );
     }
+}
+
+void FSMSLevelImporterModule::OpenImporterWindow()
+{
+    TSharedRef<SWindow> Window = SNew(SWindow)
+        .Title(FText::FromString(TEXT("SMS Level Importer")))
+        .ClientSize(FVector2D(900, 650))
+        .SupportsMinimize(true)
+        .SupportsMaximize(true)
+        [
+            SNew(SSMSImporterWindow)
+        ];
+
+    FSlateApplication::Get().AddWindow(Window);
 }
 
 #undef LOCTEXT_NAMESPACE

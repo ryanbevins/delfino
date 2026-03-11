@@ -33,7 +33,8 @@ public class SMSLevelImporter : ModuleRules
             "Kismet",
             "BlueprintGraph",
             "PhysicsCore",
-            "RenderCore"
+            "RenderCore",
+            "DesktopPlatform"
         });
     }
 }
