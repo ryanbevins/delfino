@@ -1,0 +1,18 @@
+{
+    "FileVersion": 3,
+    "Version": 1,
+    "VersionName": "1.0.0",
+    "FriendlyName": "SMS Level Importer",
+    "Description": "Imports Super Mario Sunshine levels from GameCube ISO into UE5",
+    "Category": "Editor",
+    "CreatedBy": "ryana",
+    "CanContainContent": false,
+    "IsBetaVersion": true,
+    "Modules": [
+        {
+            "Name": "SMSLevelImporter",
+            "Type": "Editor",
+            "LoadingPhase": "PostEngineInit"
+        }
+    ]
+}
