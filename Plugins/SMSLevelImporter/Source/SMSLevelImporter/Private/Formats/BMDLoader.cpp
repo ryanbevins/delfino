@@ -1,8 +1,18 @@
 // BMDLoader.cpp - J3D BMD/BDL model format parser implementation
 
 #include "Formats/BMDLoader.h"
+#include "Formats/BTILoader.h"
 #include "Util/BigEndianStream.h"
 #include "SMSLevelImporterModule.h"
+
+#include "AssetRegistry/AssetRegistryModule.h"
+#include "Engine/StaticMesh.h"
+#include "MeshDescription.h"
+#include "StaticMeshDescription.h"
+#include "StaticMeshAttributes.h"
+#include "Materials/Material.h"
+#include "Materials/MaterialInstanceConstant.h"
+#include "Materials/MaterialExpressionTextureSampleParameter2D.h"
 
 // ============================================================================
 // Parse — main entry point
@@ -1175,4 +1185,252 @@ bool FBMDLoader::ParseINF1(FBigEndianStream& Stream, const FBMDBlock& Block,
 
 	UE_LOG(LogSMSImporter, Verbose, TEXT("BMD INF1: %d shape-material mappings"), OutShapeToMaterial.Num());
 	return true;
+}
+
+// ============================================================================
+// CreateStaticMesh — Convert parsed FBMDModel into UE5 UStaticMesh asset
+// ============================================================================
+
+UStaticMesh* FBMDLoader::CreateStaticMesh(UObject* Outer, const FString& Name,
+	const FBMDModel& Model, const FString& AssetPath)
+{
+	// 1. Create package for the mesh
+	FString MeshPackagePath = FString::Printf(TEXT("%s/Meshes/SM_%s"), *AssetPath, *Name);
+	UPackage* MeshPackage = CreatePackage(*MeshPackagePath);
+	MeshPackage->FullyLoad();
+
+	UStaticMesh* StaticMesh = NewObject<UStaticMesh>(MeshPackage,
+		*FString::Printf(TEXT("SM_%s"), *Name), RF_Public | RF_Standalone);
+
+	// 2. Build FMeshDescription
+	FMeshDescription MeshDesc;
+	FStaticMeshAttributes Attributes(MeshDesc);
+	Attributes.Register();
+
+	// Get attribute accessors
+	TVertexAttributesRef<FVector3f> VertexPositions =
+		MeshDesc.GetVertexPositions();
+	TVertexInstanceAttributesRef<FVector3f> VertexNormals =
+		MeshDesc.VertexInstanceAttributes().GetAttributesRef<FVector3f>(
+			MeshAttribute::VertexInstance::Normal);
+	TVertexInstanceAttributesRef<FVector2f> VertexUVs =
+		MeshDesc.VertexInstanceAttributes().GetAttributesRef<FVector2f>(
+			MeshAttribute::VertexInstance::TextureCoordinate);
+	TVertexInstanceAttributesRef<FVector4f> VertexColors =
+		MeshDesc.VertexInstanceAttributes().GetAttributesRef<FVector4f>(
+			MeshAttribute::VertexInstance::Color);
+
+	// 3. Create base material and material instances
+	UMaterial* BaseMaterial = GetOrCreateBaseMaterial(AssetPath);
+	TArray<UMaterialInstanceConstant*> MaterialInstances;
+
+	for (int32 i = 0; i < Model.Materials.Num(); i++)
+	{
+		MaterialInstances.Add(CreateMaterialInstance(MeshPackage, Model.Materials[i],
+			Model.Textures, BaseMaterial, AssetPath, i));
+	}
+
+	// 4. For each shape, create a polygon group (one per material slot)
+	TMap<int32, FPolygonGroupID> MatToGroup;
+
+	for (const FBMDShape& Shape : Model.Shapes)
+	{
+		int32 MatIdx = FMath::Max(0, Shape.MaterialIndex);
+		if (!MatToGroup.Contains(MatIdx))
+		{
+			FPolygonGroupID GroupID = MeshDesc.CreatePolygonGroup();
+			MatToGroup.Add(MatIdx, GroupID);
+		}
+	}
+
+	// If no shapes have materials, create at least one default group
+	if (MatToGroup.Num() == 0)
+	{
+		MatToGroup.Add(0, MeshDesc.CreatePolygonGroup());
+	}
+
+	// 5. Add vertices and triangles
+	// Coordinate conversion: UE.X = GC.X, UE.Y = GC.Z, UE.Z = GC.Y
+	// Winding order reversed (2,1,0 instead of 0,1,2) due to handedness change
+
+	int32 TotalTriangles = 0;
+
+	for (const FBMDShape& Shape : Model.Shapes)
+	{
+		int32 MatIdx = FMath::Max(0, Shape.MaterialIndex);
+		FPolygonGroupID GroupID = MatToGroup[MatIdx];
+
+		for (const FBMDPrimitive& Prim : Shape.Primitives)
+		{
+			// Every 3 vertices = 1 triangle
+			for (int32 i = 0; i + 2 < Prim.Vertices.Num(); i += 3)
+			{
+				TArray<FVertexInstanceID> TriVerts;
+				TriVerts.SetNum(3);
+
+				for (int32 j = 0; j < 3; j++)
+				{
+					const FBMDVertex& V = Prim.Vertices[i + j];
+
+					// Create vertex (position only)
+					FVertexID VertID = MeshDesc.CreateVertex();
+					FVector3f ConvertedPos(V.Position.X, V.Position.Z, V.Position.Y);
+					VertexPositions[VertID] = ConvertedPos;
+
+					// Create vertex instance (per-corner attributes)
+					FVertexInstanceID InstID = MeshDesc.CreateVertexInstance(VertID);
+
+					if (V.bHasNormal)
+					{
+						VertexNormals[InstID] = FVector3f(V.Normal.X, V.Normal.Z, V.Normal.Y);
+					}
+
+					if (V.NumTexCoords > 0)
+					{
+						VertexUVs.Set(InstID, 0, V.TexCoords[0]);
+					}
+
+					if (V.bHasColor0)
+					{
+						VertexColors[InstID] = FVector4f(
+							V.Color0.R / 255.f, V.Color0.G / 255.f,
+							V.Color0.B / 255.f, V.Color0.A / 255.f);
+					}
+
+					// Reverse winding for handedness change
+					TriVerts[2 - j] = InstID;
+				}
+
+				MeshDesc.CreatePolygon(GroupID, TriVerts);
+				TotalTriangles++;
+			}
+		}
+	}
+
+	if (TotalTriangles == 0)
+	{
+		UE_LOG(LogSMSImporter, Warning, TEXT("BMD CreateStaticMesh: No triangles for '%s'"), *Name);
+		return nullptr;
+	}
+
+	// 6. Assign material slots
+	TArray<FStaticMaterial> StaticMaterials;
+	for (auto& Pair : MatToGroup)
+	{
+		int32 MatIdx = Pair.Key;
+		UMaterialInterface* Mat = (MatIdx < MaterialInstances.Num()) ?
+			static_cast<UMaterialInterface*>(MaterialInstances[MatIdx]) : nullptr;
+		StaticMaterials.Add(FStaticMaterial(Mat));
+	}
+	StaticMesh->SetStaticMaterials(StaticMaterials);
+
+	// 7. Build mesh from description
+	TArray<const FMeshDescription*> MeshDescs;
+	MeshDescs.Add(&MeshDesc);
+	UStaticMesh::FBuildMeshDescriptionsParams Params;
+	Params.bBuildSimpleCollision = false;
+	StaticMesh->BuildFromMeshDescriptions(MeshDescs, Params);
+
+	// 8. Register asset with Content Browser
+	FAssetRegistryModule::AssetCreated(StaticMesh);
+	MeshPackage->MarkPackageDirty();
+
+	UE_LOG(LogSMSImporter, Log, TEXT("BMD: Created static mesh '%s' with %d triangles, %d material slots"),
+		*Name, TotalTriangles, StaticMaterials.Num());
+
+	return StaticMesh;
+}
+
+// ============================================================================
+// GetOrCreateBaseMaterial — Shared parent material for all BMD material instances
+// ============================================================================
+
+UMaterial* FBMDLoader::GetOrCreateBaseMaterial(const FString& AssetPath)
+{
+	FString MatPath = FString::Printf(TEXT("%s/Materials/M_SMS_Base"), *AssetPath);
+
+	// Check if already exists
+	UMaterial* Existing = LoadObject<UMaterial>(nullptr, *(MatPath + TEXT(".M_SMS_Base")));
+	if (Existing)
+	{
+		return Existing;
+	}
+
+	UPackage* Package = CreatePackage(*MatPath);
+	Package->FullyLoad();
+
+	UMaterial* Material = NewObject<UMaterial>(Package, TEXT("M_SMS_Base"),
+		RF_Public | RF_Standalone);
+
+	// Create texture sample parameter connected to Base Color
+	UMaterialExpressionTextureSampleParameter2D* TexParam =
+		NewObject<UMaterialExpressionTextureSampleParameter2D>(Material);
+	TexParam->ParameterName = TEXT("BaseColorTexture");
+	Material->GetExpressionCollection().AddExpression(TexParam);
+
+#if WITH_EDITORONLY_DATA
+	Material->GetEditorOnlyData()->BaseColor.Expression = TexParam;
+#endif
+
+	// Two-sided by default (SMS models often need it)
+	Material->TwoSided = true;
+
+	Material->PreEditChange(nullptr);
+	Material->PostEditChange();
+
+	FAssetRegistryModule::AssetCreated(Material);
+	Package->MarkPackageDirty();
+
+	UE_LOG(LogSMSImporter, Log, TEXT("BMD: Created base material at %s"), *MatPath);
+
+	return Material;
+}
+
+// ============================================================================
+// CreateMaterialInstance — Per-BMD-material instance with texture assignment
+// ============================================================================
+
+UMaterialInstanceConstant* FBMDLoader::CreateMaterialInstance(UObject* Outer,
+	const FBMDMaterial& Mat, const TArray<FBMDTextureEntry>& Textures,
+	UMaterial* BaseMaterial, const FString& AssetPath, int32 MatIndex)
+{
+	FString CleanName = Mat.Name.IsEmpty()
+		? FString::Printf(TEXT("Mat_%d"), MatIndex)
+		: Mat.Name;
+
+	FString MatPackagePath = FString::Printf(TEXT("%s/Materials/MI_%s"), *AssetPath, *CleanName);
+	UPackage* Package = CreatePackage(*MatPackagePath);
+	Package->FullyLoad();
+
+	UMaterialInstanceConstant* MIC = NewObject<UMaterialInstanceConstant>(Package,
+		*FString::Printf(TEXT("MI_%s"), *CleanName), RF_Public | RF_Standalone);
+	MIC->SetParentEditorOnly(BaseMaterial);
+
+	// Set texture parameter if this material references a valid texture
+	if (Mat.TextureIndices.Num() > 0 && Mat.TextureIndices[0] >= 0
+		&& Mat.TextureIndices[0] < Textures.Num())
+	{
+		const FBMDTextureEntry& TexEntry = Textures[Mat.TextureIndices[0]];
+
+		// Create UTexture2D from decoded pixels via BTI loader
+		if (TexEntry.RGBA8Pixels.Num() > 0)
+		{
+			UTexture2D* Tex = FBTILoader::CreateTexture(Package,
+				FString::Printf(TEXT("T_%s_%d"), *CleanName, Mat.TextureIndices[0]),
+				TexEntry.Header.Width, TexEntry.Header.Height,
+				TexEntry.RGBA8Pixels, TexEntry.Header.WrapS, TexEntry.Header.WrapT);
+
+			if (Tex)
+			{
+				MIC->SetTextureParameterValueEditorOnly(
+					FMaterialParameterInfo(TEXT("BaseColorTexture")), Tex);
+			}
+		}
+	}
+
+	MIC->InitStaticPermutation();
+	FAssetRegistryModule::AssetCreated(MIC);
+	Package->MarkPackageDirty();
+
+	return MIC;
 }

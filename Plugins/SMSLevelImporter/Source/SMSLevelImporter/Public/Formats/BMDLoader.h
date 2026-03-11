@@ -152,7 +152,12 @@ struct FBMDModel
 	TMap<int32, int32> ShapeToMaterial;
 };
 
-// ---- Parser ----
+// Forward declarations for UE5 asset types
+class UStaticMesh;
+class UMaterial;
+class UMaterialInstanceConstant;
+
+// ---- Parser / Asset Creator ----
 
 class SMSLEVELIMPORTER_API FBMDLoader
 {
@@ -164,6 +169,26 @@ public:
 	 * @return true on success.
 	 */
 	static bool Parse(const TArray<uint8>& Data, FBMDModel& OutModel);
+
+	/**
+	 * Create UStaticMesh from parsed BMD model. Also creates materials and textures.
+	 * @param Outer     Outer object for transient ownership (can be GetTransientPackage()).
+	 * @param Name      Base name for the mesh asset (e.g. "DolpicPlaza").
+	 * @param Model     Parsed BMD model data from Parse().
+	 * @param AssetPath Base content path like "/Game/SMS/DolpicPlaza/Episode0".
+	 * @return The created UStaticMesh, or nullptr on failure.
+	 */
+	static UStaticMesh* CreateStaticMesh(UObject* Outer, const FString& Name,
+		const FBMDModel& Model, const FString& AssetPath);
+
+private:
+	/** Create a base material asset (parent for all material instances). */
+	static UMaterial* GetOrCreateBaseMaterial(const FString& AssetPath);
+
+	/** Create a material instance for one BMD material entry. */
+	static UMaterialInstanceConstant* CreateMaterialInstance(UObject* Outer,
+		const FBMDMaterial& Mat, const TArray<FBMDTextureEntry>& Textures,
+		UMaterial* BaseMaterial, const FString& AssetPath, int32 MatIndex);
 
 private:
 	// Phase 1: Scan all blocks in the file
