@@ -31,6 +31,20 @@ bool FGCISOReader::Open(const FString& ISOPath)
 	Close();
 
 	IPlatformFile& PlatformFile = IPlatformFile::GetPlatformPhysical();
+
+	// Validate file size is within reasonable GC disc range (> 1MB and < 2GB)
+	const int64 FileSize = PlatformFile.FileSize(*ISOPath);
+	if (FileSize < 1024 * 1024)
+	{
+		UE_LOG(LogGCISO, Warning, TEXT("ISO file too small (%lld bytes), expected > 1MB for a GC disc: %s"), FileSize, *ISOPath);
+		return false;
+	}
+	if (FileSize > 2LL * 1024 * 1024 * 1024)
+	{
+		UE_LOG(LogGCISO, Warning, TEXT("ISO file too large (%lld bytes), expected < 2GB for a GC disc: %s"), FileSize, *ISOPath);
+		return false;
+	}
+
 	FileHandle = PlatformFile.OpenRead(*ISOPath);
 	if (!FileHandle)
 	{
@@ -53,6 +67,27 @@ bool FGCISOReader::Open(const FString& ISOPath)
 		return false;
 	}
 	GameCode = FString(4, reinterpret_cast<const char*>(GameCodeBytes));
+
+	// Validate game code is 4 printable ASCII characters
+	{
+		bool bValidGameCode = true;
+		for (int32 i = 0; i < 4; ++i)
+		{
+			const uint8 Ch = GameCodeBytes[i];
+			if (Ch < 0x20 || Ch > 0x7E)
+			{
+				bValidGameCode = false;
+				break;
+			}
+		}
+		if (!bValidGameCode)
+		{
+			UE_LOG(LogGCISO, Warning, TEXT("Game code contains non-printable ASCII characters (0x%02X 0x%02X 0x%02X 0x%02X), file may not be a valid GC disc"),
+				GameCodeBytes[0], GameCodeBytes[1], GameCodeBytes[2], GameCodeBytes[3]);
+			Close();
+			return false;
+		}
+	}
 
 	// Read FST position and length from DVDBB2 (offset 0x0420)
 	// DVDBB2 starts at 0x0420. FSTPosition is at offset 0x04 within it = 0x0424
@@ -211,6 +246,13 @@ bool FGCISOReader::ParseFST()
 	}
 
 	const uint32 TotalEntries = ReadBE32(Data, 8);
+
+	if (TotalEntries > 50000)
+	{
+		UE_LOG(LogGCISO, Warning, TEXT("FST entry count %u exceeds maximum (50000), file appears corrupt"), TotalEntries);
+		return false;
+	}
+
 	const uint32 ExpectedMinSize = TotalEntries * 12;
 	if (ExpectedMinSize > static_cast<uint32>(FSTData.Num()))
 	{

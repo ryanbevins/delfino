@@ -91,6 +91,21 @@ public:
 		const FString& BlueprintBasePath,
 		const TMap<FString, UStaticMesh*>& ObjectMeshes);
 
+	/**
+	 * Remap all actors of one SMS Blueprint class to another in the given world.
+	 * Finds actors whose class name contains BP_SMS_{OldClassName}, records their
+	 * transforms, destroys the old actors, and spawns new actors of NewClass.
+	 * @return The number of actors replaced.
+	 */
+	static int32 RemapObjectType(UWorld* World, const FString& OldClassName, UClass* NewClass);
+
+	/**
+	 * Get all unique SMS object type names found in a world (from BP_SMS_* actors).
+	 * Scans all actors in the world and extracts the type name portion from
+	 * any actor whose class name matches the BP_SMS_* pattern.
+	 */
+	static TArray<FString> GetSMSObjectTypesInWorld(UWorld* World);
+
 private:
 	/**
 	 * Read the genObject() header: u32 chunk size, then within the chunk

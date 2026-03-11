@@ -141,6 +141,20 @@ bool FBMDLoader::Parse(const TArray<uint8>& Data, FBMDModel& OutModel)
 // ScanBlocks
 // ============================================================================
 
+// Known BMD/BDL block magic values for validation
+static bool IsKnownBlockMagic(uint32 Magic)
+{
+	return Magic == BMDMagic::INF1
+		|| Magic == BMDMagic::VTX1
+		|| Magic == BMDMagic::EVP1
+		|| Magic == BMDMagic::DRW1
+		|| Magic == BMDMagic::JNT1
+		|| Magic == BMDMagic::SHP1
+		|| Magic == BMDMagic::MAT3
+		|| Magic == BMDMagic::MAT2
+		|| Magic == BMDMagic::TEX1;
+}
+
 bool FBMDLoader::ScanBlocks(FBigEndianStream& Stream, uint32 BlockCount, TArray<FBMDBlock>& OutBlocks)
 {
 	// First block starts at offset 0x20
@@ -164,6 +178,15 @@ bool FBMDLoader::ScanBlocks(FBigEndianStream& Stream, uint32 BlockCount, TArray<
 		{
 			UE_LOG(LogSMSImporter, Error, TEXT("BMD: Block %u has invalid size %u"), i, Block.Size);
 			return false;
+		}
+
+		if (!IsKnownBlockMagic(Block.Magic))
+		{
+			UE_LOG(LogSMSImporter, Warning,
+				TEXT("BMD: Block %u has unknown magic 0x%08X at offset %lld, skipping"),
+				i, Block.Magic, Offset);
+			Offset += Block.Size;
+			continue;
 		}
 
 		OutBlocks.Add(Block);
@@ -562,9 +585,12 @@ void FBMDLoader::DecodeDisplayList(const uint8* DLData, int64 DLSize,
 
 		if (!bIsDraw)
 		{
-			// Unknown opcode — skip. In BMD display lists, only draw commands
-			// and NOPs are typically present.
-			continue;
+			// Unrecognized opcode — skip the rest of this display list with a warning.
+			// In BMD display lists, only draw commands and NOPs are typically present.
+			UE_LOG(LogSMSImporter, Warning,
+				TEXT("BMD SHP1: Unrecognized display list opcode 0x%02X at offset %lld, skipping rest of display list"),
+				Opcode, DLStream.Tell() - 1);
+			break;
 		}
 
 		if (DLStream.Tell() + 2 > DLSize)
@@ -1026,6 +1052,31 @@ bool FBMDLoader::ParseMAT3(FBigEndianStream& Stream, const FBMDBlock& Block,
 }
 
 // ============================================================================
+// CreatePlaceholderTexture — 8x8 magenta/black checkerboard
+// ============================================================================
+
+TArray<uint8> FBMDLoader::CreatePlaceholderTexture()
+{
+	TArray<uint8> Pixels;
+	Pixels.SetNumUninitialized(8 * 8 * 4);
+
+	for (int32 y = 0; y < 8; ++y)
+	{
+		for (int32 x = 0; x < 8; ++x)
+		{
+			const int32 Idx = (y * 8 + x) * 4;
+			const bool bMagenta = ((x + y) % 2 == 0);
+			Pixels[Idx + 0] = bMagenta ? 255 : 0;   // R
+			Pixels[Idx + 1] = 0;                      // G
+			Pixels[Idx + 2] = bMagenta ? 255 : 0;   // B
+			Pixels[Idx + 3] = 255;                    // A
+		}
+	}
+
+	return Pixels;
+}
+
+// ============================================================================
 // ParseTEX1
 // ============================================================================
 
@@ -1091,6 +1142,17 @@ bool FBMDLoader::ParseTEX1(FBigEndianStream& Stream, const FBMDBlock& Block,
 					OutTextures[i].RGBA8Pixels = FBTILoader::DecodePixels(Header,
 						ImageData.GetData(), PaletteData.GetData());
 				}
+
+				// If decode failed, use placeholder
+				if (OutTextures[i].RGBA8Pixels.Num() == 0)
+				{
+					UE_LOG(LogSMSImporter, Warning,
+						TEXT("BMD TEX1: Failed to decode paletted texture %d (%dx%d fmt=%d), using placeholder"),
+						i, Header.Width, Header.Height, static_cast<uint8>(Header.Format));
+					OutTextures[i].RGBA8Pixels = CreatePlaceholderTexture();
+					OutTextures[i].Header.Width = 8;
+					OutTextures[i].Header.Height = 8;
+				}
 				continue;
 			}
 		}
@@ -1104,6 +1166,17 @@ bool FBMDLoader::ParseTEX1(FBigEndianStream& Stream, const FBMDBlock& Block,
 			TArray<uint8> ImageData = Stream.ReadBytes(ImageSize);
 
 			OutTextures[i].RGBA8Pixels = FBTILoader::DecodePixels(Header, ImageData.GetData());
+		}
+
+		// If decode failed, use placeholder
+		if (OutTextures[i].RGBA8Pixels.Num() == 0)
+		{
+			UE_LOG(LogSMSImporter, Warning,
+				TEXT("BMD TEX1: Failed to decode texture %d (%dx%d fmt=%d), using placeholder"),
+				i, Header.Width, Header.Height, static_cast<uint8>(Header.Format));
+			OutTextures[i].RGBA8Pixels = CreatePlaceholderTexture();
+			OutTextures[i].Header.Width = 8;
+			OutTextures[i].Header.Height = 8;
 		}
 
 		if (i < Names.Num())

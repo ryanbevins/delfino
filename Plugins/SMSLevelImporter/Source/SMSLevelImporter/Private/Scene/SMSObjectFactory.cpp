@@ -7,6 +7,7 @@
 #include "Engine/Blueprint.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/World.h"
+#include "EngineUtils.h"
 #include "GameFramework/Actor.h"
 #include "Components/BillboardComponent.h"
 #include "Components/StaticMeshComponent.h"
@@ -580,6 +581,10 @@ void FSMSObjectFactory::ParseSceneGraphNode(FBigEndianStream& Stream,
 		// As a heuristic, if there are at least 12 bytes left in the chunk
 		// and they look like valid float coordinates, try extracting a position.
 
+		UE_LOG(LogSMSImporter, Warning,
+			TEXT("scene.bin:   Unknown type '%s' ('%s') encountered, attempting heuristic parse"),
+			*ClassName, *InstanceName);
+
 		const int64 Remaining = ChunkEnd - Stream.Tell();
 
 		if (Remaining >= 12)
@@ -653,10 +658,24 @@ bool FSMSObjectFactory::ParseSceneBin(const TArray<uint8>& Data,
 	//   TNameRef::genObject(stream, stream2) -> reads chunk header
 	//   obj->load(stream2) -> loads from sub-stream
 	// This is exactly what ParseSceneGraphNode does.
+	const int32 PlacementsBefore = OutPlacements.Num();
 	ParseSceneGraphNode(Stream, OutPlacements, 0);
 
+	// Count how many placements came from unknown types (heuristic extraction)
+	int32 UnknownTypeCount = 0;
+	for (const FSMSObjectPlacement& P : OutPlacements)
+	{
+		if (!IsContainerType(P.ClassName) && !IsActorType(P.ClassName)
+			&& !IsPlacementType(P.ClassName))
+		{
+			++UnknownTypeCount;
+		}
+	}
+
+	const int32 TotalParsed = OutPlacements.Num();
 	UE_LOG(LogSMSImporter, Log,
-		TEXT("scene.bin: Extracted %d placements"), OutPlacements.Num());
+		TEXT("scene.bin: Parsed %d objects, %d skipped due to unknown types"),
+		TotalParsed, UnknownTypeCount);
 
 	return true;
 }
@@ -855,4 +874,128 @@ void FSMSObjectFactory::SpawnObjectsInLevel(UWorld* World,
 
 	UE_LOG(LogSMSImporter, Log,
 		TEXT("Successfully spawned %d / %d objects"), SpawnedCount, Placements.Num());
+}
+
+// ============================================================================
+// Remap utility
+// ============================================================================
+
+int32 FSMSObjectFactory::RemapObjectType(UWorld* World, const FString& OldClassName, UClass* NewClass)
+{
+	if (!World)
+	{
+		UE_LOG(LogSMSImporter, Error, TEXT("RemapObjectType: World is null"));
+		return 0;
+	}
+
+	if (!NewClass)
+	{
+		UE_LOG(LogSMSImporter, Error, TEXT("RemapObjectType: NewClass is null"));
+		return 0;
+	}
+
+	const FString SearchPattern = FString::Printf(TEXT("BP_SMS_%s"), *OldClassName);
+
+	// Phase 1: Collect actors to replace (don't modify while iterating)
+	struct FActorRecord
+	{
+		FTransform Transform;
+		FString Label;
+	};
+	TArray<FActorRecord> Records;
+	TArray<AActor*> ActorsToDestroy;
+
+	for (TActorIterator<AActor> It(World); It; ++It)
+	{
+		AActor* Actor = *It;
+		if (!Actor)
+		{
+			continue;
+		}
+
+		const FString ActorClassName = Actor->GetClass()->GetName();
+		if (ActorClassName.Contains(SearchPattern))
+		{
+			FActorRecord Record;
+			Record.Transform = Actor->GetActorTransform();
+			Record.Label = Actor->GetActorLabel();
+			Records.Add(MoveTemp(Record));
+			ActorsToDestroy.Add(Actor);
+		}
+	}
+
+	// Phase 2: Destroy old actors
+	for (AActor* Actor : ActorsToDestroy)
+	{
+		Actor->Destroy();
+	}
+
+	// Phase 3: Spawn replacements
+	int32 ReplacedCount = 0;
+	for (const FActorRecord& Record : Records)
+	{
+		FActorSpawnParameters SpawnParams;
+		SpawnParams.SpawnCollisionHandlingOverride =
+			ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+
+		AActor* NewActor = World->SpawnActor<AActor>(
+			NewClass, &Record.Transform, SpawnParams);
+
+		if (NewActor)
+		{
+			if (!Record.Label.IsEmpty())
+			{
+				NewActor->SetActorLabel(Record.Label);
+			}
+			++ReplacedCount;
+		}
+	}
+
+	UE_LOG(LogSMSImporter, Log,
+		TEXT("RemapObjectType: Replaced %d actors of '%s' with '%s'"),
+		ReplacedCount, *OldClassName, *NewClass->GetName());
+
+	return ReplacedCount;
+}
+
+TArray<FString> FSMSObjectFactory::GetSMSObjectTypesInWorld(UWorld* World)
+{
+	TSet<FString> UniqueTypes;
+
+	if (!World)
+	{
+		return TArray<FString>();
+	}
+
+	const FString Prefix = TEXT("BP_SMS_");
+
+	for (TActorIterator<AActor> It(World); It; ++It)
+	{
+		AActor* Actor = *It;
+		if (!Actor)
+		{
+			continue;
+		}
+
+		const FString ActorClassName = Actor->GetClass()->GetName();
+		const int32 PrefixIdx = ActorClassName.Find(Prefix);
+		if (PrefixIdx != INDEX_NONE)
+		{
+			// Extract the type name after "BP_SMS_"
+			FString TypeName = ActorClassName.Mid(PrefixIdx + Prefix.Len());
+			// Strip any _C suffix from generated class names
+			if (TypeName.EndsWith(TEXT("_C")))
+			{
+				TypeName.LeftChopInline(2);
+			}
+			if (!TypeName.IsEmpty())
+			{
+				UniqueTypes.Add(TypeName);
+			}
+		}
+	}
+
+	TArray<FString> Result = UniqueTypes.Array();
+	Result.Sort();
+	return Result;
 }

@@ -171,6 +171,13 @@ public:
 	static bool Parse(const TArray<uint8>& Data, FBMDModel& OutModel);
 
 	/**
+	 * Create an 8x8 RGBA8 magenta/black checkerboard placeholder texture.
+	 * Used as a fallback when texture decoding fails.
+	 * @return 256 bytes of RGBA8 pixel data (8x8 x 4 bytes).
+	 */
+	static TArray<uint8> CreatePlaceholderTexture();
+
+	/**
 	 * Create UStaticMesh from parsed BMD model. Also creates materials and textures.
 	 * @param Outer     Outer object for transient ownership (can be GetTransientPackage()).
 	 * @param Name      Base name for the mesh asset (e.g. "DolpicPlaza").
