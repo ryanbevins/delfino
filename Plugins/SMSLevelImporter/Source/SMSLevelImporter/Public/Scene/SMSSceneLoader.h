@@ -10,11 +10,25 @@
 
 class FGCISOReader;
 class UStaticMesh;
+class USkeletalMesh;
+class USkeleton;
 class UWorld;
 
-struct FRARCArchive;
+class FRARCArchive;
 struct FSMSLevelInfo;
 struct FSMSObjectPlacement;
+struct FBMDModel;
+
+/**
+ * Information about a character archive found in the ISO.
+ */
+struct FSMSCharacterInfo
+{
+	FString ArchivePath;        // ISO path e.g. "/scene/mario.szs"
+	FString DisplayName;        // "Mario"
+	TArray<FString> BckFiles;   // BCK animation paths found inside the archive
+	bool bHasSkinning = false;  // Confirmed EVP1 present after quick-scan
+};
 
 DECLARE_DELEGATE_TwoParams(FOnSMSImportProgress, float /*Progress 0-1*/, const FString& /*StatusMessage*/);
 
@@ -75,6 +89,24 @@ public:
 	 * @return The generated UWorld, or nullptr on failure.
 	 */
 	UWorld* ImportScene(const FString& LevelName, int32 Episode,
+		const FSMSImportOptions& Options,
+		FOnSMSImportProgress ProgressCallback = FOnSMSImportProgress());
+
+	/**
+	 * Scan the ISO for character archives (non-level .szs files with skinned BMDs).
+	 * Must be called after OpenISO().
+	 */
+	TArray<FSMSCharacterInfo> ScanCharacterArchives();
+
+	/**
+	 * Import a character from the ISO as a skeletal mesh + selected animations.
+	 * @param Character       Character info from ScanCharacterArchives().
+	 * @param SelectedBckFiles  Which BCK files to import.
+	 * @param Options         Import options.
+	 * @param ProgressCallback  Optional progress delegate.
+	 */
+	void ImportCharacter(const FSMSCharacterInfo& Character,
+		const TSet<FString>& SelectedBckFiles,
 		const FSMSImportOptions& Options,
 		FOnSMSImportProgress ProgressCallback = FOnSMSImportProgress());
 

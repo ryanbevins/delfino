@@ -7,12 +7,25 @@
 
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "Engine/StaticMesh.h"
+#include "Engine/SkeletalMesh.h"
+#include "Animation/Skeleton.h"
 #include "MeshDescription.h"
 #include "StaticMeshDescription.h"
 #include "StaticMeshAttributes.h"
+#include "SkeletalMeshAttributes.h"
 #include "Materials/Material.h"
 #include "Materials/MaterialInstanceConstant.h"
 #include "Materials/MaterialExpressionTextureSampleParameter2D.h"
+#include "ReferenceSkeleton.h"
+#include "Rendering/SkeletalMeshLODModel.h"
+#include "UObject/SavePackage.h"
+#include "Animation/Skeleton.h"
+#include "BoneWeights.h"
+#include "SkinWeightsAttributesRef.h"
+#include "IMeshBuilderModule.h"
+#include "Interfaces/ITargetPlatformManagerModule.h"
+#include "Rendering/SkeletalMeshModel.h"
+#include "Rendering/SkeletalMeshLODModel.h"
 
 // ============================================================================
 // Parse — main entry point
@@ -30,9 +43,9 @@ bool FBMDLoader::Parse(const TArray<uint8>& Data, FBMDModel& OutModel)
 
 	// ---- Validate file header ----
 	const uint32 Magic = Stream.ReadU32();
-	if (Magic != BMDMagic::J3D2)
+	if (Magic != BMDMagic::J3D1 && Magic != BMDMagic::J3D2)
 	{
-		UE_LOG(LogSMSImporter, Error, TEXT("BMD: Invalid magic 0x%08X (expected J3D2)"), Magic);
+		UE_LOG(LogSMSImporter, Error, TEXT("BMD: Invalid magic 0x%08X (expected J3D1/J3D2)"), Magic);
 		return false;
 	}
 
@@ -110,13 +123,55 @@ bool FBMDLoader::Parse(const TArray<uint8>& Data, FBMDModel& OutModel)
 		}
 	}
 
-	// ---- Phase 6: Parse INF1 ----
+	// ---- Phase 6: Parse JNT1 ----
+	const FBMDBlock* JNT1Block = FindBlock(Blocks, BMDMagic::JNT1);
+	if (JNT1Block)
+	{
+		if (!ParseJNT1(Stream, *JNT1Block, OutModel.Joints, OutModel.JointNames))
+		{
+			UE_LOG(LogSMSImporter, Warning, TEXT("BMD: JNT1 parse failed"));
+		}
+	}
+
+	// ---- Phase 6b: Parse EVP1 ----
+	const FBMDBlock* EVP1Block = FindBlock(Blocks, BMDMagic::EVP1);
+	if (EVP1Block)
+	{
+		if (ParseEVP1(Stream, *EVP1Block, OutModel.EVP1))
+		{
+			// Only mark as skinned if there are actual envelopes with weights
+			OutModel.bHasSkinning = (OutModel.EVP1.Envelopes.Num() > 0);
+		}
+	}
+
+	// ---- Phase 6c: Parse DRW1 ----
+	const FBMDBlock* DRW1Block = FindBlock(Blocks, BMDMagic::DRW1);
+	if (DRW1Block)
+	{
+		ParseDRW1(Stream, *DRW1Block, OutModel.DRW1);
+	}
+
+	// ---- Phase 6d: Parse INF1 ----
 	const FBMDBlock* INF1Block = FindBlock(Blocks, BMDMagic::INF1);
 	if (INF1Block)
 	{
-		if (!ParseINF1(Stream, *INF1Block, OutModel.ShapeToMaterial))
+		if (!ParseINF1(Stream, *INF1Block, OutModel.ShapeToMaterial, OutModel.Joints))
 		{
 			UE_LOG(LogSMSImporter, Warning, TEXT("BMD: INF1 parse failed, shape-material mapping unavailable"));
+		}
+	}
+
+	// ---- Phase 6e: Build world transforms for joints ----
+	for (int32 i = 0; i < OutModel.Joints.Num(); i++)
+	{
+		FBMDJoint& Joint = OutModel.Joints[i];
+		if (Joint.ParentIndex >= 0 && Joint.ParentIndex < OutModel.Joints.Num())
+		{
+			Joint.WorldMatrix = Joint.LocalMatrix * OutModel.Joints[Joint.ParentIndex].WorldMatrix;
+		}
+		else
+		{
+			Joint.WorldMatrix = Joint.LocalMatrix;
 		}
 	}
 
@@ -632,7 +687,14 @@ void FBMDLoader::DecodeDisplayList(const uint8* DLData, int64 DLSize,
 					// Direct data: for matrix indices this is a single byte
 					if (Desc.Attr <= GXAttr::Tex7MatIdx)
 					{
-						if (!DLStream.IsEOF()) DLStream.ReadU8();
+						if (!DLStream.IsEOF())
+						{
+							uint8 DirectVal = DLStream.ReadU8();
+							if (Desc.Attr == GXAttr::PositionMatIdx)
+							{
+								Vert.PosMatIdx = DirectVal;
+							}
+						}
 					}
 					else
 					{
@@ -642,9 +704,17 @@ void FBMDLoader::DecodeDisplayList(const uint8* DLData, int64 DLSize,
 					continue;
 				}
 
+				// Capture PosMatIdx for indexed access
+				if (Desc.Attr == GXAttr::PositionMatIdx)
+				{
+					Vert.PosMatIdx = static_cast<uint8>(Index);
+					continue;
+				}
+
 				// Look up actual vertex data by index
 				if (Desc.Attr == GXAttr::Position)
 				{
+					Vert.PosIndex = Index;
 					if (Index >= 0 && Index < Verts.Positions.Num())
 					{
 						Vert.Position = Verts.Positions[Index];
@@ -768,9 +838,9 @@ bool FBMDLoader::ParseSHP1(FBigEndianStream& Stream, const FBMDBlock& Block,
 	const uint32 IndexRemapOffset = Stream.ReadU32();
 	Stream.ReadU32(); // name table offset (often 0)
 	const uint32 VtxDescListOffset = Stream.ReadU32();
-	Stream.ReadU32(); // matrix table offset
+	const uint32 MatrixTableOffset = Stream.ReadU32();
 	const uint32 DisplayListDataOffset = Stream.ReadU32();
-	Stream.ReadU32(); // matrix init data offset
+	const uint32 MatrixInitDataOffset = Stream.ReadU32();
 	const uint32 DrawInitDataOffset = Stream.ReadU32();
 
 	UE_LOG(LogSMSImporter, Verbose, TEXT("BMD SHP1: %d shapes"), ShapeCount);
@@ -791,7 +861,7 @@ bool FBMDLoader::ParseSHP1(FBigEndianStream& Stream, const FBMDBlock& Block,
 		Stream.Skip(1);   // padding
 		const uint16 MtxGroupCount = Stream.ReadU16();
 		const uint16 VtxDescListIndex = Stream.ReadU16();
-		Stream.ReadU16(); // mtxInitDataIndex
+		const uint16 MtxInitDataIndex = Stream.ReadU16();
 		const uint16 DrawInitDataIndex = Stream.ReadU16();
 		// Skip rest (radius, bbox)
 
@@ -799,11 +869,45 @@ bool FBMDLoader::ParseSHP1(FBigEndianStream& Stream, const FBMDBlock& Block,
 		// VtxDescListIndex is a byte offset into the vtx descriptor list area
 		TArray<FVtxAttrDesc> VtxDescs = ParseVtxDescList(Stream, Base + VtxDescListOffset + VtxDescListIndex);
 
-		// Process each draw batch (MtxGroupCount batches)
+		// Process each draw batch/packet (MtxGroupCount packets)
 		FBMDShape& Shape = OutShapes[ShapeIdx];
+
+		Shape.BatchMatrixTables.SetNum(MtxGroupCount);
+
+		// GX has 10 position matrix slots. Build a cumulative table across
+		// packets: each packet may only update some slots; others persist.
+		TArray<uint16> RunningMtxTable;
+		RunningMtxTable.Init(0xFFFF, 10); // 10 GX matrix slots, initially unset
 
 		for (uint16 BatchIdx = 0; BatchIdx < MtxGroupCount; BatchIdx++)
 		{
+			// Read matrix init data for this packet (0x08 bytes per entry)
+			// Each entry: u16 useMtxIndex, u16 count, u32 firstIndex
+			if (MatrixInitDataOffset != 0)
+			{
+				const int64 MtxInitAddr = Base + MatrixInitDataOffset + (MtxInitDataIndex + BatchIdx) * 0x08;
+				Stream.Seek(MtxInitAddr);
+				Stream.ReadU16(); // useMtxIndex (skip)
+				const uint16 MtxCount = Stream.ReadU16();
+				const uint32 MtxFirstIndex = Stream.ReadU32();
+
+				// Read this packet's raw matrix table entries
+				Stream.Seek(Base + MatrixTableOffset + MtxFirstIndex * 2);
+				for (uint16 m = 0; m < MtxCount && m < 10; m++)
+				{
+					const uint16 RawVal = Stream.ReadU16();
+					if (RawVal != 0xFFFF)
+					{
+						// Update the running/cumulative table
+						RunningMtxTable[m] = RawVal;
+					}
+					// else: 0xFFFF means keep previous value (already in RunningMtxTable)
+				}
+
+				// Store the full cumulative state as this packet's resolved table
+				Shape.BatchMatrixTables[BatchIdx] = RunningMtxTable;
+			}
+
 			// Read draw init data (0x08 bytes per batch)
 			const int64 DrawInitAddr = Base + DrawInitDataOffset + (DrawInitDataIndex + BatchIdx) * 0x08;
 			Stream.Seek(DrawInitAddr);
@@ -831,6 +935,7 @@ bool FBMDLoader::ParseSHP1(FBigEndianStream& Stream, const FBMDBlock& Block,
 			TArray<uint8> DLData = Stream.ReadBytes(DLSize);
 
 			FBMDPrimitive Prim;
+			Prim.BatchIndex = BatchIdx;
 			DecodeDisplayList(DLData.GetData(), DLSize, VtxDescs, Verts, Prim);
 
 			if (Prim.Vertices.Num() > 0)
@@ -1194,16 +1299,10 @@ bool FBMDLoader::ParseTEX1(FBigEndianStream& Stream, const FBMDBlock& Block,
 // ============================================================================
 
 bool FBMDLoader::ParseINF1(FBigEndianStream& Stream, const FBMDBlock& Block,
-	TMap<int32, int32>& OutShapeToMaterial)
+	TMap<int32, int32>& OutShapeToMaterial, TArray<FBMDJoint>& OutJoints)
 {
 	const int64 Base = Block.Offset;
 
-	// J3DModelInfoBlock layout:
-	//   +0x08: u16 flags
-	//   +0x0A: padding
-	//   +0x0C: u32 packetNum
-	//   +0x10: u32 vtxNum
-	//   +0x14: u32 hierarchyOffset (relative to block start)
 	Stream.Seek(Base + 0x14);
 	const uint32 HierarchyOffset = Stream.ReadU32();
 
@@ -1213,11 +1312,17 @@ bool FBMDLoader::ParseINF1(FBigEndianStream& Stream, const FBMDBlock& Block,
 		return false;
 	}
 
-	// Walk the scene graph
+	// Walk the scene graph with a parent stack for joint hierarchy
+	// CurrentScopeParent: the parent for all joints at the current nesting level
+	//   (only changed by OPEN/CLOSE)
+	// LastJoint: the most recently encountered joint (OPEN makes its children)
 	int32 CurrentMaterial = -1;
+	TArray<int32> ScopeParentStack;
+	int32 CurrentScopeParent = -1;
+	int32 LastJoint = -1;
+
 	Stream.Seek(Base + HierarchyOffset);
 
-	// Safety limit to prevent infinite loops
 	const int64 MaxEntries = (Block.Size - HierarchyOffset) / 4;
 	int64 EntryCount = 0;
 
@@ -1229,19 +1334,36 @@ bool FBMDLoader::ParseINF1(FBigEndianStream& Stream, const FBMDBlock& Block,
 
 		if (Type == 0x00) // End
 		{
+			UE_LOG(LogSMSImporter, Warning, TEXT("DEBUG INF1[%lld]: END"), EntryCount - 1);
 			break;
 		}
-		else if (Type == 0x01) // Open child scope
+		else if (Type == 0x01) // Open child scope — children of LastJoint
 		{
-			// Push — we don't need a full stack for the simple material-shape mapping
+			ScopeParentStack.Add(CurrentScopeParent);
+			CurrentScopeParent = LastJoint;
+			UE_LOG(LogSMSImporter, Warning, TEXT("DEBUG INF1[%lld]: OPEN (new scope parent=%d, stack depth=%d)"),
+				EntryCount - 1, CurrentScopeParent, ScopeParentStack.Num());
 		}
-		else if (Type == 0x02) // Close scope
+		else if (Type == 0x02) // Close scope — pop back to previous parent
 		{
-			// Pop
+			if (ScopeParentStack.Num() > 0)
+			{
+				CurrentScopeParent = ScopeParentStack.Last();
+				ScopeParentStack.Pop();
+				UE_LOG(LogSMSImporter, Warning, TEXT("DEBUG INF1[%lld]: CLOSE (restored scope parent=%d, stack depth=%d)"),
+					EntryCount - 1, CurrentScopeParent, ScopeParentStack.Num());
+			}
 		}
 		else if (Type == 0x10) // Joint
 		{
-			// Joint reference — skip
+			const int32 JointIdx = static_cast<int32>(Index);
+			UE_LOG(LogSMSImporter, Warning, TEXT("DEBUG INF1[%lld]: JOINT %d (parent=%d)"),
+				EntryCount - 1, JointIdx, CurrentScopeParent);
+			if (JointIdx >= 0 && JointIdx < OutJoints.Num())
+			{
+				OutJoints[JointIdx].ParentIndex = CurrentScopeParent;
+			}
+			LastJoint = JointIdx;
 		}
 		else if (Type == 0x11) // Material
 		{
@@ -1256,8 +1378,993 @@ bool FBMDLoader::ParseINF1(FBigEndianStream& Stream, const FBMDBlock& Block,
 		}
 	}
 
-	UE_LOG(LogSMSImporter, Verbose, TEXT("BMD INF1: %d shape-material mappings"), OutShapeToMaterial.Num());
+	UE_LOG(LogSMSImporter, Verbose, TEXT("BMD INF1: %d shape-material mappings, %d joints with hierarchy"),
+		OutShapeToMaterial.Num(), OutJoints.Num());
 	return true;
+}
+
+// ============================================================================
+// ParseEVP1 — Envelope (multi-bone weight) data
+// ============================================================================
+
+bool FBMDLoader::ParseEVP1(FBigEndianStream& Stream, const FBMDBlock& Block, FBMDEVP1Data& OutEVP1)
+{
+	const int64 Base = Block.Offset;
+
+	Stream.Seek(Base + 0x08);
+	const uint16 EnvelopeCount = Stream.ReadU16();
+	Stream.Skip(2); // padding
+
+	const uint32 IndexCountOffset = Stream.ReadU32();   // +0x0C
+	const uint32 IndexDataOffset = Stream.ReadU32();     // +0x10
+	const uint32 WeightDataOffset = Stream.ReadU32();    // +0x14
+	const uint32 InvBindMtxOffset = Stream.ReadU32();    // +0x18
+
+	// Read per-envelope index counts
+	TArray<uint8> IndexCounts;
+	IndexCounts.SetNum(EnvelopeCount);
+	Stream.Seek(Base + IndexCountOffset);
+	for (uint16 i = 0; i < EnvelopeCount; i++)
+	{
+		IndexCounts[i] = Stream.ReadU8();
+	}
+
+	// Read index + weight data in lockstep
+	OutEVP1.Envelopes.SetNum(EnvelopeCount);
+	int64 IdxPos = Base + IndexDataOffset;
+	int64 WgtPos = Base + WeightDataOffset;
+
+	for (uint16 i = 0; i < EnvelopeCount; i++)
+	{
+		FBMDEnvelope& Env = OutEVP1.Envelopes[i];
+		const uint8 Count = IndexCounts[i];
+		Env.BoneIndices.SetNum(Count);
+		Env.Weights.SetNum(Count);
+
+		Stream.Seek(IdxPos);
+		for (uint8 j = 0; j < Count; j++)
+		{
+			Env.BoneIndices[j] = Stream.ReadU16();
+		}
+		IdxPos = Stream.Tell();
+
+		Stream.Seek(WgtPos);
+		for (uint8 j = 0; j < Count; j++)
+		{
+			Env.Weights[j] = Stream.ReadF32();
+		}
+		WgtPos = Stream.Tell();
+	}
+
+	// Read inverse bind matrices (3x4 floats each = 12 floats)
+	// Count = number of joints referenced, which we determine from the data
+	// The matrix count is (InvBindMtxOffset to end-of-block) / (12*4)
+	Stream.Seek(Base + InvBindMtxOffset);
+	const int64 MtxDataSize = (Base + Block.Size) - (Base + InvBindMtxOffset);
+	const int32 MtxCount = static_cast<int32>(MtxDataSize / (12 * sizeof(float)));
+
+	OutEVP1.InverseBindMatrices.SetNum(MtxCount);
+	for (int32 i = 0; i < MtxCount; i++)
+	{
+		float M[12];
+		for (int32 j = 0; j < 12; j++)
+		{
+			M[j] = Stream.ReadF32();
+		}
+		// J3D stores 3x4 matrices in column-vector convention:
+		//   [R00 R01 R02 Tx]
+		//   [R10 R11 R12 Ty]
+		//   [R20 R21 R22 Tz]
+		// UE uses row-vector convention (v' = v * M), so transpose:
+		//   rotation cols → rows, translation → row 3
+		OutEVP1.InverseBindMatrices[i] = FMatrix44f(
+			FPlane4f(M[0], M[4], M[8],  0.f),
+			FPlane4f(M[1], M[5], M[9],  0.f),
+			FPlane4f(M[2], M[6], M[10], 0.f),
+			FPlane4f(M[3], M[7], M[11], 1.f));
+	}
+
+	UE_LOG(LogSMSImporter, Log, TEXT("BMD EVP1: %d envelopes, %d inverse bind matrices"),
+		EnvelopeCount, MtxCount);
+	return true;
+}
+
+// ============================================================================
+// ParseDRW1 — Draw matrix type (rigid/weighted) mapping
+// ============================================================================
+
+bool FBMDLoader::ParseDRW1(FBigEndianStream& Stream, const FBMDBlock& Block, FBMDDRW1Data& OutDRW1)
+{
+	const int64 Base = Block.Offset;
+
+	Stream.Seek(Base + 0x08);
+	const uint16 Count = Stream.ReadU16();
+	Stream.Skip(2); // padding
+
+	const uint32 IsWeightedOffset = Stream.ReadU32(); // +0x0C
+	const uint32 IndicesOffset = Stream.ReadU32();     // +0x10
+
+	OutDRW1.IsWeighted.SetNum(Count);
+	Stream.Seek(Base + IsWeightedOffset);
+	for (uint16 i = 0; i < Count; i++)
+	{
+		OutDRW1.IsWeighted[i] = Stream.ReadU8();
+	}
+
+	OutDRW1.Indices.SetNum(Count);
+	Stream.Seek(Base + IndicesOffset);
+	for (uint16 i = 0; i < Count; i++)
+	{
+		OutDRW1.Indices[i] = Stream.ReadU16();
+	}
+
+	int32 RigidCount = 0, WeightedCount = 0;
+	for (uint16 i = 0; i < Count; i++)
+	{
+		if (OutDRW1.IsWeighted[i]) WeightedCount++;
+		else RigidCount++;
+	}
+
+	UE_LOG(LogSMSImporter, Log, TEXT("BMD DRW1: %d entries (%d rigid, %d weighted)"),
+		Count, RigidCount, WeightedCount);
+	return true;
+}
+
+// ============================================================================
+// ParseJNT1 — Joint hierarchy data
+// ============================================================================
+
+bool FBMDLoader::ParseJNT1(FBigEndianStream& Stream, const FBMDBlock& Block,
+	TArray<FBMDJoint>& OutJoints, TArray<FString>& OutJointNames)
+{
+	const int64 Base = Block.Offset;
+
+	Stream.Seek(Base + 0x08);
+	const uint16 JointCount = Stream.ReadU16();
+	Stream.Skip(2); // padding
+
+	const uint32 JointDataOffset = Stream.ReadU32();  // +0x0C
+	const uint32 IndexRemapOffset = Stream.ReadU32(); // +0x10
+	const uint32 NameTableOffset = Stream.ReadU32();   // +0x14
+
+	// Read name table
+	if (NameTableOffset != 0)
+	{
+		OutJointNames = ReadNameTable(Stream, Base + NameTableOffset);
+	}
+
+	OutJoints.SetNum(JointCount);
+
+	for (uint16 i = 0; i < JointCount; i++)
+	{
+		// Read index remap
+		Stream.Seek(Base + IndexRemapOffset + i * 2);
+		const uint16 RemappedIdx = Stream.ReadU16();
+
+		// Each joint entry is 0x40 bytes
+		const int64 JointAddr = Base + JointDataOffset + RemappedIdx * 0x40;
+		Stream.Seek(JointAddr);
+
+		FBMDJoint& Joint = OutJoints[i];
+
+		// Set name
+		if (i < OutJointNames.Num())
+		{
+			Joint.Name = OutJointNames[i];
+		}
+		else
+		{
+			Joint.Name = FString::Printf(TEXT("joint_%d"), i);
+		}
+
+		// JNT1 joint entry layout (0x40 bytes):
+		// +0x00: u16 matrixType, u8 inheritFlags, u8 pad
+		// +0x04: f32 scaleX, f32 scaleY, f32 scaleZ
+		// +0x10: s16 rotX, s16 rotY, s16 rotZ, u16 pad
+		// +0x18: f32 pad (alignment? or bounding data)
+		// +0x1C: f32 transX, f32 transY, f32 transZ
+
+		Stream.Seek(JointAddr + 0x04);
+		Joint.Scale.X = Stream.ReadF32();
+		Joint.Scale.Y = Stream.ReadF32();
+		Joint.Scale.Z = Stream.ReadF32();
+
+		// Rotation at +0x10: 3x s16 (padding to align)
+		const int16 RotX = Stream.ReadS16();
+		const int16 RotY = Stream.ReadS16();
+		const int16 RotZ = Stream.ReadS16();
+		Stream.Skip(2); // padding
+
+		const float RotScale = 180.0f / 32768.0f;
+		Joint.Rotation.X = RotX * RotScale;
+		Joint.Rotation.Y = RotY * RotScale;
+		Joint.Rotation.Z = RotZ * RotScale;
+
+		// Translation at +0x1C
+		Joint.Translation.X = Stream.ReadF32();
+		Joint.Translation.Y = Stream.ReadF32();
+		Joint.Translation.Z = Stream.ReadF32();
+
+		// Build local transform matrix from SRT in GC space
+		// GC uses extrinsic ZYX Euler = matrix Rz * Ry * Rx (intrinsic XYZ)
+		const float RXr = FMath::DegreesToRadians(Joint.Rotation.X);
+		const float RYr = FMath::DegreesToRadians(Joint.Rotation.Y);
+		const float RZr = FMath::DegreesToRadians(Joint.Rotation.Z);
+
+		FQuat QX(FVector::XAxisVector, RXr);
+		FQuat QY(FVector::YAxisVector, RYr);
+		FQuat QZ(FVector::ZAxisVector, RZr);
+		FQuat Quat = QZ * QY * QX; // Rz * Ry * Rx
+
+		FVector Trans(Joint.Translation.X, Joint.Translation.Y, Joint.Translation.Z);
+		FVector Scale(Joint.Scale.X, Joint.Scale.Y, Joint.Scale.Z);
+
+		FTransform LocalTransform(Quat, Trans, Scale);
+		Joint.LocalMatrix = FMatrix44f(LocalTransform.ToMatrixWithScale());
+	}
+
+	UE_LOG(LogSMSImporter, Log, TEXT("BMD JNT1: %d joints"), JointCount);
+	return true;
+}
+
+// ============================================================================
+// CreateSkeletalMesh — Convert parsed FBMDModel with skinning into USkeletalMesh
+// ============================================================================
+
+USkeletalMesh* FBMDLoader::CreateSkeletalMesh(UObject* Outer, const FString& Name,
+	const FBMDModel& Model, const FString& AssetPath)
+{
+	if (!Model.bHasSkinning || Model.Joints.Num() == 0)
+	{
+		UE_LOG(LogSMSImporter, Warning, TEXT("BMD CreateSkeletalMesh: No skinning data for '%s'"), *Name);
+		return nullptr;
+	}
+
+	// ---- DEBUG: Log skinning data summary ----
+	{
+		int32 RigidCount = 0, WeightedCount = 0;
+		for (int32 i = 0; i < Model.DRW1.IsWeighted.Num(); i++)
+		{
+			if (Model.DRW1.IsWeighted[i] == 0) RigidCount++;
+			else WeightedCount++;
+		}
+		UE_LOG(LogSMSImporter, Warning, TEXT("DEBUG SKEL '%s': DRW1 entries=%d (rigid=%d, weighted=%d), EVP1 envelopes=%d, joints=%d"),
+			*Name, Model.DRW1.IsWeighted.Num(), RigidCount, WeightedCount, Model.EVP1.Envelopes.Num(), Model.Joints.Num());
+	}
+
+	// ---- DEBUG: Log ALL joint names ----
+	{
+		FString AllNames;
+		for (int32 i = 0; i < Model.Joints.Num(); i++)
+		{
+			AllNames += FString::Printf(TEXT("[%d]%s "), i, *Model.Joints[i].Name);
+		}
+		UE_LOG(LogSMSImporter, Warning, TEXT("DEBUG JOINTS: %s"), *AllNames);
+	}
+
+	// ---- DEBUG: Log joint transforms (GC space) — first 10 + bones 26-28 ----
+	for (int32 i = 0; i < FMath::Min(10, Model.Joints.Num()); i++)
+	{
+		const FBMDJoint& J = Model.Joints[i];
+		UE_LOG(LogSMSImporter, Warning, TEXT("DEBUG JOINT[%d] '%s' parent=%d | GC_Trans=(%.2f, %.2f, %.2f) GC_Rot=(%.2f, %.2f, %.2f) GC_Scale=(%.2f, %.2f, %.2f)"),
+			i, *J.Name, J.ParentIndex,
+			J.Translation.X, J.Translation.Y, J.Translation.Z,
+			J.Rotation.X, J.Rotation.Y, J.Rotation.Z,
+			J.Scale.X, J.Scale.Y, J.Scale.Z);
+
+		// Log the world matrix diagonal and translation row
+		UE_LOG(LogSMSImporter, Warning, TEXT("DEBUG JOINT[%d] WorldMat row0=(%.4f,%.4f,%.4f,%.4f) row1=(%.4f,%.4f,%.4f,%.4f) row2=(%.4f,%.4f,%.4f,%.4f) row3=(%.4f,%.4f,%.4f,%.4f)"),
+			i,
+			J.WorldMatrix.M[0][0], J.WorldMatrix.M[0][1], J.WorldMatrix.M[0][2], J.WorldMatrix.M[0][3],
+			J.WorldMatrix.M[1][0], J.WorldMatrix.M[1][1], J.WorldMatrix.M[1][2], J.WorldMatrix.M[1][3],
+			J.WorldMatrix.M[2][0], J.WorldMatrix.M[2][1], J.WorldMatrix.M[2][2], J.WorldMatrix.M[2][3],
+			J.WorldMatrix.M[3][0], J.WorldMatrix.M[3][1], J.WorldMatrix.M[3][2], J.WorldMatrix.M[3][3]);
+	}
+	// Log bones 26-28 (head/cap area) specifically
+	for (int32 i = 26; i < FMath::Min(29, Model.Joints.Num()); i++)
+	{
+		const FBMDJoint& J = Model.Joints[i];
+		UE_LOG(LogSMSImporter, Warning, TEXT("DEBUG JOINT[%d] '%s' parent=%d | GC_Trans=(%.2f, %.2f, %.2f)"),
+			i, *J.Name, J.ParentIndex, J.Translation.X, J.Translation.Y, J.Translation.Z);
+		UE_LOG(LogSMSImporter, Warning, TEXT("DEBUG JOINT[%d] WorldMat row0=(%.4f,%.4f,%.4f,%.4f) row1=(%.4f,%.4f,%.4f,%.4f) row2=(%.4f,%.4f,%.4f,%.4f) row3=(%.4f,%.4f,%.4f,%.4f)"),
+			i,
+			J.WorldMatrix.M[0][0], J.WorldMatrix.M[0][1], J.WorldMatrix.M[0][2], J.WorldMatrix.M[0][3],
+			J.WorldMatrix.M[1][0], J.WorldMatrix.M[1][1], J.WorldMatrix.M[1][2], J.WorldMatrix.M[1][3],
+			J.WorldMatrix.M[2][0], J.WorldMatrix.M[2][1], J.WorldMatrix.M[2][2], J.WorldMatrix.M[2][3],
+			J.WorldMatrix.M[3][0], J.WorldMatrix.M[3][1], J.WorldMatrix.M[3][2], J.WorldMatrix.M[3][3]);
+	}
+
+	// ---- 1. Create USkeleton ----
+	FString SkelPackagePath = FString::Printf(TEXT("%s/Skeletons/SKEL_%s"), *AssetPath, *Name);
+	UPackage* SkelPackage = CreatePackage(*SkelPackagePath);
+	SkelPackage->FullyLoad();
+
+	USkeleton* Skeleton = NewObject<USkeleton>(SkelPackage,
+		*FString::Printf(TEXT("SKEL_%s"), *Name), RF_Public | RF_Standalone);
+
+	FReferenceSkeleton RefSkeleton;
+	{
+		FReferenceSkeletonModifier Modifier(RefSkeleton, Skeleton);
+
+		for (int32 i = 0; i < Model.Joints.Num(); i++)
+		{
+			const FBMDJoint& Joint = Model.Joints[i];
+			FMeshBoneInfo BoneInfo;
+			BoneInfo.Name = FName(*Joint.Name);
+			BoneInfo.ParentIndex = Joint.ParentIndex;
+
+			// Convert GC local transform to UE space using matrix sandwich:
+			// M_ue = P * M_gc * P, where P swaps Y↔Z (rows/cols 1,2)
+			FMatrix44f GCLocal = Joint.LocalMatrix;
+
+			// Swap rows 1 and 2
+			for (int32 c = 0; c < 4; c++)
+			{
+				float Tmp = GCLocal.M[1][c];
+				GCLocal.M[1][c] = GCLocal.M[2][c];
+				GCLocal.M[2][c] = Tmp;
+			}
+			// Swap columns 1 and 2
+			for (int32 r = 0; r < 4; r++)
+			{
+				float Tmp = GCLocal.M[r][1];
+				GCLocal.M[r][1] = GCLocal.M[r][2];
+				GCLocal.M[r][2] = Tmp;
+			}
+
+			FTransform BoneTransform;
+			BoneTransform.SetFromMatrix(FMatrix(GCLocal));
+
+			// DEBUG: Log converted bone transforms for first 10 joints
+			if (i < 10)
+			{
+				FVector BT = BoneTransform.GetTranslation();
+				FQuat BQ = BoneTransform.GetRotation();
+				FVector BS = BoneTransform.GetScale3D();
+				UE_LOG(LogSMSImporter, Warning, TEXT("DEBUG BONE[%d] UE_RefPose: Trans=(%.2f,%.2f,%.2f) Quat=(%.4f,%.4f,%.4f,%.4f) Scale=(%.2f,%.2f,%.2f)"),
+					i, BT.X, BT.Y, BT.Z, BQ.X, BQ.Y, BQ.Z, BQ.W, BS.X, BS.Y, BS.Z);
+			}
+
+			Modifier.Add(BoneInfo, BoneTransform);
+		}
+	}
+
+	UE_LOG(LogSMSImporter, Log, TEXT("BMD: Created skeleton '%s' with %d bones"), *Name, Model.Joints.Num());
+
+	// ---- 2. Create USkeletalMesh ----
+	FString MeshPackagePath = FString::Printf(TEXT("%s/Meshes/SK_%s"), *AssetPath, *Name);
+	UPackage* MeshPackage = CreatePackage(*MeshPackagePath);
+	MeshPackage->FullyLoad();
+
+	USkeletalMesh* SkelMesh = NewObject<USkeletalMesh>(MeshPackage,
+		*FString::Printf(TEXT("SK_%s"), *Name), RF_Public | RF_Standalone);
+
+	// Assign reference skeleton to the mesh BEFORE merging into USkeleton
+	SkelMesh->SetRefSkeleton(RefSkeleton);
+	SkelMesh->SetSkeleton(Skeleton);
+
+	// Merge the mesh's ref skeleton into the USkeleton bone tree
+	Skeleton->MergeAllBonesToBoneTree(SkelMesh);
+
+	FAssetRegistryModule::AssetCreated(Skeleton);
+	SkelPackage->MarkPackageDirty();
+
+	// ---- 3. Build FMeshDescription ----
+	FMeshDescription MeshDesc;
+	FSkeletalMeshAttributes SkelAttribs(MeshDesc);
+	SkelAttribs.Register();
+
+	TVertexAttributesRef<FVector3f> VertexPositions = MeshDesc.GetVertexPositions();
+	TVertexInstanceAttributesRef<FVector3f> VertexNormals =
+		MeshDesc.VertexInstanceAttributes().GetAttributesRef<FVector3f>(
+			MeshAttribute::VertexInstance::Normal);
+	TVertexInstanceAttributesRef<FVector2f> VertexUVs =
+		MeshDesc.VertexInstanceAttributes().GetAttributesRef<FVector2f>(
+			MeshAttribute::VertexInstance::TextureCoordinate);
+	TVertexInstanceAttributesRef<FVector4f> VertexColors =
+		MeshDesc.VertexInstanceAttributes().GetAttributesRef<FVector4f>(
+			MeshAttribute::VertexInstance::Color);
+
+	// ---- 3b. Set bone data on MeshDescription ----
+	{
+		FSkeletalMeshAttributes::FBoneNameAttributesRef BoneNames = SkelAttribs.GetBoneNames();
+		FSkeletalMeshAttributes::FBoneParentIndexAttributesRef BoneParentIndices = SkelAttribs.GetBoneParentIndices();
+		FSkeletalMeshAttributes::FBonePoseAttributesRef BonePoses = SkelAttribs.GetBonePoses();
+
+		for (int32 i = 0; i < Model.Joints.Num(); i++)
+		{
+			const FBMDJoint& Joint = Model.Joints[i];
+			FBoneID BoneID = SkelAttribs.CreateBone();
+
+			BoneNames[BoneID] = FName(*Joint.Name);
+			BoneParentIndices[BoneID] = Joint.ParentIndex;
+
+			// Same GC→UE matrix sandwich as RefSkeleton above
+			FMatrix44f UELocal = Joint.LocalMatrix;
+			for (int32 c = 0; c < 4; c++)
+			{
+				float Tmp = UELocal.M[1][c];
+				UELocal.M[1][c] = UELocal.M[2][c];
+				UELocal.M[2][c] = Tmp;
+			}
+			for (int32 r = 0; r < 4; r++)
+			{
+				float Tmp = UELocal.M[r][1];
+				UELocal.M[r][1] = UELocal.M[r][2];
+				UELocal.M[r][2] = Tmp;
+			}
+			FTransform BonePose;
+			BonePose.SetFromMatrix(FMatrix(UELocal));
+			BonePoses[BoneID] = BonePose;
+		}
+	}
+
+	// We'll store per-vertex bone weights in a side structure and apply them
+	// after mesh creation, since the MeshDescription bone weight API varies by UE version.
+	struct FVertexSkinData
+	{
+		TArray<int32> BoneIndices;
+		TArray<float> BoneWeights;
+	};
+	TMap<FVertexID, FVertexSkinData> VertexSkinMap;
+
+	// Create base material and material instances
+	UMaterial* BaseMaterial = GetOrCreateBaseMaterial(AssetPath);
+	TArray<UMaterialInstanceConstant*> MaterialInstances;
+	for (int32 i = 0; i < Model.Materials.Num(); i++)
+	{
+		MaterialInstances.Add(CreateMaterialInstance(MeshPackage, Model.Materials[i],
+			Model.Textures, BaseMaterial, AssetPath, i));
+	}
+
+	// Create polygon groups per material and set material slot names
+	TPolygonGroupAttributesRef<FName> PolygonGroupMaterialSlotNames =
+		MeshDesc.PolygonGroupAttributes().GetAttributesRef<FName>(
+			MeshAttribute::PolygonGroup::ImportedMaterialSlotName);
+
+	TMap<int32, FPolygonGroupID> MatToGroup;
+	for (const FBMDShape& Shape : Model.Shapes)
+	{
+		int32 MatIdx = FMath::Max(0, Shape.MaterialIndex);
+		if (!MatToGroup.Contains(MatIdx))
+		{
+			FPolygonGroupID GroupID = MeshDesc.CreatePolygonGroup();
+			MatToGroup.Add(MatIdx, GroupID);
+			PolygonGroupMaterialSlotNames[GroupID] = FName(*FString::Printf(TEXT("Material_%d"), MatIdx));
+		}
+	}
+	if (MatToGroup.Num() == 0)
+	{
+		FPolygonGroupID GroupID = MeshDesc.CreatePolygonGroup();
+		MatToGroup.Add(0, GroupID);
+		PolygonGroupMaterialSlotNames[GroupID] = FName(TEXT("Material_0"));
+	}
+
+	// ---- 4. Add vertices with bone weights ----
+	// DEBUG: Log GC-space bone world matrix origins
+	for (int32 b = 0; b < Model.Joints.Num(); b++)
+	{
+		FVector4 Row3 = FVector4(Model.Joints[b].WorldMatrix.M[3][0], Model.Joints[b].WorldMatrix.M[3][1],
+			Model.Joints[b].WorldMatrix.M[3][2], Model.Joints[b].WorldMatrix.M[3][3]);
+		FString BN = (b < Model.JointNames.Num()) ? Model.JointNames[b] : TEXT("???");
+		UE_LOG(LogSMSImporter, Warning,
+			TEXT("DEBUG GC_BONE_WORLD[%d] '%s': origin_GC=(%.2f,%.2f,%.2f) → origin_UE=(%.2f,%.2f,%.2f)"),
+			b, *BN, Row3.X, Row3.Y, Row3.Z, Row3.X, Row3.Z, Row3.Y);
+	}
+
+	// DEBUG: Check InvBind * BoneWorld for a few bones (should be ~identity in bind pose)
+	for (int32 b = 0; b < FMath::Min(5, Model.Joints.Num()); b++)
+	{
+		if (b < Model.EVP1.InverseBindMatrices.Num())
+		{
+			FMatrix InvBind(Model.EVP1.InverseBindMatrices[b]);
+			FMatrix BoneWorld(Model.Joints[b].WorldMatrix);
+			FMatrix Product = InvBind * BoneWorld;
+			FString BN = (b < Model.JointNames.Num()) ? Model.JointNames[b] : TEXT("???");
+			UE_LOG(LogSMSImporter, Warning,
+				TEXT("DEBUG IB*JW[%d] '%s': diag=(%.3f,%.3f,%.3f,%.3f) trans=(%.3f,%.3f,%.3f) InvBind_origin=(%.2f,%.2f,%.2f)"),
+				b, *BN,
+				Product.M[0][0], Product.M[1][1], Product.M[2][2], Product.M[3][3],
+				Product.M[3][0], Product.M[3][1], Product.M[3][2],
+				InvBind.M[3][0], InvBind.M[3][1], InvBind.M[3][2]);
+		}
+	}
+
+	int32 TotalTriangles = 0;
+	int32 ShapeIndex = 0;
+	int32 DebugVertexCount = 0;
+	int32 DebugRigidVerts = 0, DebugWeightedVerts = 0, DebugFallbackVerts = 0;
+	int32 DebugFB_NoBatchTable = 0, DebugFB_SlotOOR = 0, DebugFB_Drw1OOR = 0, DebugFB_EnvOOR = 0;
+	float DebugMinY = FLT_MAX, DebugMaxY = -FLT_MAX;
+	float DebugMinZ_UE = FLT_MAX, DebugMaxZ_UE = -FLT_MAX;
+	TMap<int32, int32> DebugBoneCounts;
+	TSet<int32> DebugLoggedBones;
+	TMap<int32, float> DebugBoneMinZ, DebugBoneMaxZ; // per-bone UE Z range
+
+	// Vertex sharing: map (PosIndex << 8 | PosMatIdx) → VertexID
+	// This allows adjacent triangles to share vertices for smooth normals
+	TMap<int64, FVertexID> SharedVertexMap;
+
+	for (const FBMDShape& Shape : Model.Shapes)
+	{
+		int32 MatIdx = FMath::Max(0, Shape.MaterialIndex);
+		FPolygonGroupID GroupID = MatToGroup[MatIdx];
+
+		for (const FBMDPrimitive& Prim : Shape.Primitives)
+		{
+			// Get the matrix table for this batch
+			const TArray<uint16>* BatchMtxTable = nullptr;
+			if (Prim.BatchIndex < Shape.BatchMatrixTables.Num())
+			{
+				BatchMtxTable = &Shape.BatchMatrixTables[Prim.BatchIndex];
+			}
+
+			for (int32 i = 0; i + 2 < Prim.Vertices.Num(); i += 3)
+			{
+				TArray<FVertexInstanceID> TriVerts;
+				TriVerts.SetNum(3);
+
+				for (int32 j = 0; j < 3; j++)
+				{
+					const FBMDVertex& V = Prim.Vertices[i + j];
+
+					// Resolve bone weights from PosMatIdx
+					TArray<int32> BoneIdxArray;
+					TArray<float> BoneWgtArray;
+
+					if (BatchMtxTable && BatchMtxTable->Num() > 0)
+					{
+						const uint16 Slot = V.PosMatIdx / 3;
+						if (Slot < BatchMtxTable->Num())
+						{
+							const uint16 Drw1Idx = (*BatchMtxTable)[Slot];
+							if (Drw1Idx < Model.DRW1.IsWeighted.Num())
+							{
+								if (Model.DRW1.IsWeighted[Drw1Idx] == 0)
+								{
+									// Rigid: single bone
+									BoneIdxArray.Add(Model.DRW1.Indices[Drw1Idx]);
+									BoneWgtArray.Add(1.0f);
+								}
+								else
+								{
+									// Weighted: use EVP1 envelope
+									const uint16 EnvIdx = Model.DRW1.Indices[Drw1Idx];
+									if (EnvIdx < Model.EVP1.Envelopes.Num())
+									{
+										const FBMDEnvelope& Env = Model.EVP1.Envelopes[EnvIdx];
+										for (int32 k = 0; k < Env.BoneIndices.Num(); k++)
+										{
+											BoneIdxArray.Add(Env.BoneIndices[k]);
+											BoneWgtArray.Add(Env.Weights[k]);
+										}
+									}
+									else { DebugFB_EnvOOR++; }
+								}
+							}
+							else
+						{
+							DebugFB_Drw1OOR++;
+							if (DebugFB_Drw1OOR <= 5)
+							{
+								UE_LOG(LogSMSImporter, Warning,
+									TEXT("DEBUG DRW1_OOR[%d] shape=%d batch=%d slot=%d Drw1Idx=%d DRW1Size=%d"),
+									DebugFB_Drw1OOR, ShapeIndex, Prim.BatchIndex,
+									V.PosMatIdx / 3, (*BatchMtxTable)[V.PosMatIdx / 3],
+									Model.DRW1.IsWeighted.Num());
+							}
+						}
+						}
+						else
+					{
+						DebugFB_SlotOOR++;
+						if (DebugFB_SlotOOR <= 5)
+						{
+							UE_LOG(LogSMSImporter, Warning,
+								TEXT("DEBUG SLOT_OOR[%d] shape=%d batch=%d PosMatIdx=%d slot=%d tableSize=%d pos=(%.2f,%.2f,%.2f)"),
+								DebugFB_SlotOOR, ShapeIndex, Prim.BatchIndex, V.PosMatIdx,
+								V.PosMatIdx / 3, BatchMtxTable->Num(),
+								V.Position.X, V.Position.Y, V.Position.Z);
+						}
+					}
+					}
+					else { DebugFB_NoBatchTable++; }
+
+					// Fallback: bind to root bone
+					if (BoneIdxArray.Num() == 0)
+					{
+						BoneIdxArray.Add(0);
+						BoneWgtArray.Add(1.0f);
+						DebugFallbackVerts++;
+						if (DebugFallbackVerts <= 5)
+						{
+							UE_LOG(LogSMSImporter, Warning,
+								TEXT("DEBUG FALLBACK[%d] shape=%d PosMatIdx=%d batchMtxTable=%s batchMtxTableSize=%d pos=(%.2f,%.2f,%.2f)"),
+								DebugFallbackVerts, ShapeIndex, V.PosMatIdx,
+								BatchMtxTable ? TEXT("valid") : TEXT("null"),
+								BatchMtxTable ? BatchMtxTable->Num() : 0,
+								V.Position.X, V.Position.Y, V.Position.Z);
+						}
+					}
+
+					// Track rigid vs weighted
+					bool bIsRigidVert = (BoneIdxArray.Num() == 1 && BoneWgtArray[0] == 1.0f);
+					if (bIsRigidVert) DebugRigidVerts++; else DebugWeightedVerts++;
+
+					// Track GC Y range (up axis in GC) and UE Z range (up axis in UE)
+					DebugMinY = FMath::Min(DebugMinY, V.Position.Y);
+					DebugMaxY = FMath::Max(DebugMaxY, V.Position.Y);
+					float UE_Z = V.Position.Y; // After swap, UE.Z = GC.Y
+					DebugMinZ_UE = FMath::Min(DebugMinZ_UE, UE_Z);
+					DebugMaxZ_UE = FMath::Max(DebugMaxZ_UE, UE_Z);
+
+					// Compute model-space position in GC coordinates
+					FVector GCPos(V.Position.X, V.Position.Y, V.Position.Z);
+
+					if (bIsRigidVert && BoneIdxArray[0] >= 0 && BoneIdxArray[0] < Model.Joints.Num())
+					{
+						// Rigid vertices are in bone-local space — transform to model space
+						// using the GC-space bone world matrix (row-vector convention: v' = v * M)
+						const FMatrix BoneWorld(Model.Joints[BoneIdxArray[0]].WorldMatrix);
+						GCPos = BoneWorld.TransformPosition(GCPos);
+					}
+					else if (!bIsRigidVert)
+					{
+						// Weighted vertices: apply J3D weighted position matrix
+						// J3D formula (col-vec): model_pos = sum(w_i * JW_i * IB_i) * v
+						// In row-vector: model_pos = v * sum(w_i * IB_row_i * JW_row_i)
+						FMatrix BlendedMtx;
+						FMemory::Memzero(&BlendedMtx, sizeof(BlendedMtx));
+						for (int32 k = 0; k < BoneIdxArray.Num(); k++)
+						{
+							const int32 bi = BoneIdxArray[k];
+							const float w = BoneWgtArray[k];
+							if (bi >= 0 && bi < Model.Joints.Num() && bi < Model.EVP1.InverseBindMatrices.Num())
+							{
+								FMatrix InvBind(Model.EVP1.InverseBindMatrices[bi]);
+								FMatrix BoneWorld(Model.Joints[bi].WorldMatrix);
+								FMatrix Product = InvBind * BoneWorld;
+								// Component-wise weighted sum
+								for (int32 r = 0; r < 4; r++)
+									for (int32 c = 0; c < 4; c++)
+										BlendedMtx.M[r][c] += w * Product.M[r][c];
+							}
+						}
+						GCPos = BlendedMtx.TransformPosition(GCPos);
+					}
+
+					// Track bone distribution and Z range
+					int32 PrimaryBone = BoneIdxArray[0];
+					DebugBoneCounts.FindOrAdd(PrimaryBone)++;
+					float VertUE_Z = GCPos.Y; // After (X,Z,Y) swap, UE.Z = GC.Y
+					if (!DebugBoneMinZ.Contains(PrimaryBone) || VertUE_Z < DebugBoneMinZ[PrimaryBone])
+						DebugBoneMinZ.FindOrAdd(PrimaryBone) = VertUE_Z;
+					if (!DebugBoneMaxZ.Contains(PrimaryBone) || VertUE_Z > DebugBoneMaxZ[PrimaryBone])
+						DebugBoneMaxZ.FindOrAdd(PrimaryBone) = VertUE_Z;
+
+					// DEBUG: Log sample vertices — one per unique bone assignment
+					bool bShouldLog = !DebugLoggedBones.Contains(PrimaryBone);
+					if (bShouldLog)
+					{
+						DebugLoggedBones.Add(PrimaryBone);
+						FString BoneStr;
+						for (int32 bi = 0; bi < BoneIdxArray.Num(); bi++)
+						{
+							BoneStr += FString::Printf(TEXT("%d:%.2f "), BoneIdxArray[bi], BoneWgtArray[bi]);
+						}
+						FString BoneName = (PrimaryBone >= 0 && PrimaryBone < Model.JointNames.Num())
+							? Model.JointNames[PrimaryBone] : TEXT("???");
+						UE_LOG(LogSMSImporter, Warning,
+							TEXT("DEBUG VERT_SAMPLE bone=%d(%s) shape=%d %s | GC_Raw=(%.2f,%.2f,%.2f) GC_Model=(%.2f,%.2f,%.2f) UE=(%.2f,%.2f,%.2f) | PosMatIdx=%d bones=[%s]"),
+							PrimaryBone, *BoneName, ShapeIndex,
+							bIsRigidVert ? TEXT("RIGID") : TEXT("WEIGHTED"),
+							V.Position.X, V.Position.Y, V.Position.Z,
+							GCPos.X, GCPos.Y, GCPos.Z,
+							GCPos.X, GCPos.Z, GCPos.Y,
+							V.PosMatIdx, *BoneStr);
+					}
+					DebugVertexCount++;
+
+					// GC→UE coordinate conversion: (X, Z, Y)
+					// Share vertices with same position + bone assignment for smooth normals
+					const int64 VertKey = (static_cast<int64>(V.PosIndex) << 8) | static_cast<int64>(V.PosMatIdx);
+					FVertexID VertID;
+					FVertexID* ExistingVert = SharedVertexMap.Find(VertKey);
+					if (ExistingVert && V.PosIndex >= 0)
+					{
+						VertID = *ExistingVert;
+					}
+					else
+					{
+						VertID = MeshDesc.CreateVertex();
+						VertexPositions[VertID] = FVector3f(GCPos.X, GCPos.Z, GCPos.Y);
+
+						// Store bone weights (only once per shared vertex)
+						FVertexSkinData& SkinData = VertexSkinMap.Add(VertID);
+						SkinData.BoneIndices = BoneIdxArray;
+						SkinData.BoneWeights = BoneWgtArray;
+
+						if (V.PosIndex >= 0)
+						{
+							SharedVertexMap.Add(VertKey, VertID);
+						}
+					}
+
+					// Each triangle corner gets its own instance (for unique normal/UV/color)
+					FVertexInstanceID InstID = MeshDesc.CreateVertexInstance(VertID);
+
+					if (V.bHasNormal)
+					{
+						FVector GCNormal(V.Normal.X, V.Normal.Y, V.Normal.Z);
+						if (bIsRigidVert && BoneIdxArray[0] >= 0 && BoneIdxArray[0] < Model.Joints.Num())
+						{
+							const FMatrix BoneWorld(Model.Joints[BoneIdxArray[0]].WorldMatrix);
+							GCNormal = BoneWorld.TransformVector(GCNormal);
+						}
+						else if (!bIsRigidVert)
+						{
+							// Apply same blended transform to normals
+							FMatrix BlendedMtx;
+							FMemory::Memzero(&BlendedMtx, sizeof(BlendedMtx));
+							for (int32 k = 0; k < BoneIdxArray.Num(); k++)
+							{
+								const int32 bi = BoneIdxArray[k];
+								const float w = BoneWgtArray[k];
+								if (bi >= 0 && bi < Model.Joints.Num() && bi < Model.EVP1.InverseBindMatrices.Num())
+								{
+									FMatrix InvBind(Model.EVP1.InverseBindMatrices[bi]);
+									FMatrix BoneWorld(Model.Joints[bi].WorldMatrix);
+									FMatrix Product = InvBind * BoneWorld;
+									for (int32 r = 0; r < 4; r++)
+										for (int32 c = 0; c < 4; c++)
+											BlendedMtx.M[r][c] += w * Product.M[r][c];
+								}
+							}
+							GCNormal = BlendedMtx.TransformVector(GCNormal);
+						}
+						VertexNormals[InstID] = FVector3f(GCNormal.X, GCNormal.Z, GCNormal.Y);
+					}
+
+					if (V.NumTexCoords > 0)
+					{
+						VertexUVs.Set(InstID, 0, V.TexCoords[0]);
+					}
+
+					if (V.bHasColor0)
+					{
+						VertexColors[InstID] = FVector4f(
+							V.Color0.R / 255.f, V.Color0.G / 255.f,
+							V.Color0.B / 255.f, V.Color0.A / 255.f);
+					}
+
+					// Reverse winding for handedness change
+					TriVerts[2 - j] = InstID;
+				}
+
+				MeshDesc.CreatePolygon(GroupID, TriVerts);
+				TotalTriangles++;
+			}
+		}
+
+		ShapeIndex++;
+	}
+
+	// ---- DEBUG: Vertex summary ----
+	UE_LOG(LogSMSImporter, Warning, TEXT("DEBUG SKEL '%s' VERTEX SUMMARY: total=%d rigid=%d weighted=%d fallback=%d triangles=%d"),
+		*Name, DebugVertexCount, DebugRigidVerts, DebugWeightedVerts, DebugFallbackVerts, TotalTriangles);
+	UE_LOG(LogSMSImporter, Warning, TEXT("DEBUG SKEL '%s' FALLBACK REASONS: noBatchTable=%d slotOOR=%d drw1OOR=%d envOOR=%d"),
+		*Name, DebugFB_NoBatchTable, DebugFB_SlotOOR, DebugFB_Drw1OOR, DebugFB_EnvOOR);
+	UE_LOG(LogSMSImporter, Warning, TEXT("DEBUG SKEL '%s' GC_Y range: [%.2f, %.2f]  UE_Z range: [%.2f, %.2f]"),
+		*Name, DebugMinY, DebugMaxY, DebugMinZ_UE, DebugMaxZ_UE);
+
+	// Log bone distribution with Z ranges
+	for (auto& Pair : DebugBoneCounts)
+	{
+		FString BN = (Pair.Key >= 0 && Pair.Key < Model.JointNames.Num()) ? Model.JointNames[Pair.Key] : TEXT("???");
+		float MinZ = DebugBoneMinZ.Contains(Pair.Key) ? DebugBoneMinZ[Pair.Key] : 0.f;
+		float MaxZ = DebugBoneMaxZ.Contains(Pair.Key) ? DebugBoneMaxZ[Pair.Key] : 0.f;
+		UE_LOG(LogSMSImporter, Warning,
+			TEXT("DEBUG SKEL '%s' BONE_DIST[%d:%s] count=%d UE_Z=[%.1f, %.1f]"),
+			*Name, Pair.Key, *BN, Pair.Value, MinZ, MaxZ);
+	}
+
+	if (TotalTriangles == 0)
+	{
+		UE_LOG(LogSMSImporter, Warning, TEXT("BMD CreateSkeletalMesh: No triangles for '%s'"), *Name);
+		return nullptr;
+	}
+
+	// ---- 5. Assign material slots ----
+	TArray<FSkeletalMaterial> SkelMaterials;
+	for (auto& Pair : MatToGroup)
+	{
+		int32 MIdx = Pair.Key;
+		UMaterialInterface* Mat = (MIdx < MaterialInstances.Num()) ?
+			static_cast<UMaterialInterface*>(MaterialInstances[MIdx]) : nullptr;
+		SkelMaterials.Add(FSkeletalMaterial(Mat));
+	}
+	SkelMesh->SetMaterials(SkelMaterials);
+
+	// ---- 6. Apply skin weights to mesh description ----
+	{
+		FSkinWeightsVertexAttributesRef SkinWeightsRef = SkelAttribs.GetVertexSkinWeights();
+
+		for (auto& Pair : VertexSkinMap)
+		{
+			FVertexID VID = Pair.Key;
+			const FVertexSkinData& SD = Pair.Value;
+
+			const int32 NumInfluences = FMath::Min(SD.BoneIndices.Num(), (int32)MAX_TOTAL_INFLUENCES);
+
+			TArray<FBoneIndexType> BoneIndices;
+			TArray<float> BoneWeightValues;
+			BoneIndices.Reserve(NumInfluences);
+			BoneWeightValues.Reserve(NumInfluences);
+
+			for (int32 k = 0; k < NumInfluences; k++)
+			{
+				if (SD.BoneWeights[k] > 0.0f)
+				{
+					BoneIndices.Add(static_cast<FBoneIndexType>(SD.BoneIndices[k]));
+					BoneWeightValues.Add(SD.BoneWeights[k]);
+				}
+			}
+
+			if (BoneIndices.Num() > 0)
+			{
+				UE::AnimationCore::FBoneWeights Weights =
+					UE::AnimationCore::FBoneWeights::Create(
+						BoneIndices.GetData(), BoneWeightValues.GetData(), BoneIndices.Num());
+
+				SkinWeightsRef.Set(VID, Weights);
+			}
+		}
+	}
+
+	// ---- 7. Build from mesh description ----
+	// Add LODInfo (source model slot)
+	SkelMesh->AddLODInfo();
+
+	// CRITICAL: Add LODModel entry to imported model — CommitMeshDescription requires this
+	FSkeletalMeshModel* ImportedModel = SkelMesh->GetImportedModel();
+	if (ImportedModel)
+	{
+		ImportedModel->LODModels.Empty();
+		ImportedModel->LODModels.Add(new FSkeletalMeshLODModel());
+	}
+
+	SkelMesh->CreateMeshDescription(0, MoveTemp(MeshDesc));
+	SkelMesh->CommitMeshDescription(0);
+
+	// Calculate inverse ref matrices (needed for skinning)
+	SkelMesh->CalculateInvRefMatrices();
+
+	// DEBUG: Log computed ref pose bone world transforms and inv ref matrices
+	{
+		const FReferenceSkeleton& FinalRefSkel = SkelMesh->GetRefSkeleton();
+		UE_LOG(LogSMSImporter, Warning, TEXT("DEBUG SKEL '%s' RefBones count=%d"),
+			*Name, FinalRefSkel.GetNum());
+
+		for (int32 i = 0; i < FMath::Min(10, FinalRefSkel.GetNum()); i++)
+		{
+			const FTransform& RefPose = FinalRefSkel.GetRefBonePose()[i];
+			FVector RT = RefPose.GetTranslation();
+			FQuat RQ = RefPose.GetRotation();
+			FVector RS = RefPose.GetScale3D();
+			UE_LOG(LogSMSImporter, Warning, TEXT("DEBUG REFPOSE[%d] '%s' parent=%d: Trans=(%.2f,%.2f,%.2f) Quat=(%.4f,%.4f,%.4f,%.4f) Scale=(%.2f,%.2f,%.2f)"),
+				i, *FinalRefSkel.GetBoneName(i).ToString(), FinalRefSkel.GetParentIndex(i),
+				RT.X, RT.Y, RT.Z, RQ.X, RQ.Y, RQ.Z, RQ.W, RS.X, RS.Y, RS.Z);
+		}
+
+		// Also log the inverse ref matrices
+		const TArray<FMatrix44f>& InvRefMats = SkelMesh->GetRefBasesInvMatrix();
+		UE_LOG(LogSMSImporter, Warning, TEXT("DEBUG SKEL '%s' InvRefBasesMatrix count=%d"), *Name, InvRefMats.Num());
+		for (int32 i = 0; i < FMath::Min(5, InvRefMats.Num()); i++)
+		{
+			const FMatrix44f& M = InvRefMats[i];
+			UE_LOG(LogSMSImporter, Warning, TEXT("DEBUG INVREF[%d] row0=(%.4f,%.4f,%.4f,%.4f) row3=(%.4f,%.4f,%.4f,%.4f)"),
+				i,
+				M.M[0][0], M.M[0][1], M.M[0][2], M.M[0][3],
+				M.M[3][0], M.M[3][1], M.M[3][2], M.M[3][3]);
+		}
+	}
+
+	// DEBUG: Manually compute skinned positions for first few vertices to verify ref pose = identity
+	{
+		const TArray<FMatrix44f>& InvRefMats = SkelMesh->GetRefBasesInvMatrix();
+		const FReferenceSkeleton& FRS = SkelMesh->GetRefSkeleton();
+
+		// Compute composed world transforms for each bone
+		TArray<FMatrix> BoneWorldTransforms;
+		BoneWorldTransforms.SetNum(FRS.GetNum());
+		for (int32 b = 0; b < FRS.GetNum(); b++)
+		{
+			FMatrix LocalMat = FRS.GetRefBonePose()[b].ToMatrixWithScale();
+			int32 ParentIdx = FRS.GetParentIndex(b);
+			if (ParentIdx >= 0)
+			{
+				BoneWorldTransforms[b] = LocalMat * BoneWorldTransforms[ParentIdx];
+			}
+			else
+			{
+				BoneWorldTransforms[b] = LocalMat;
+			}
+		}
+
+		// Log composed world for first 5 bones
+		for (int32 b = 0; b < FMath::Min(5, FRS.GetNum()); b++)
+		{
+			FVector WorldT = BoneWorldTransforms[b].GetOrigin();
+			UE_LOG(LogSMSImporter, Warning, TEXT("DEBUG BONE_WORLD[%d] Origin=(%.2f,%.2f,%.2f)"), b, WorldT.X, WorldT.Y, WorldT.Z);
+		}
+
+		// Test skinning equation on a few stored vertices
+		// stored_pos → BoneWorld * InvRef * stored_pos should = stored_pos in ref pose
+		int32 TestIdx = 0;
+		for (auto& Pair : VertexSkinMap)
+		{
+			if (TestIdx >= 5) break;
+			FVertexID VID = Pair.Key;
+			const FVertexSkinData& SD = Pair.Value;
+			FVector3f StoredPos = VertexPositions[VID];
+
+			FVector SkinnedPos = FVector::ZeroVector;
+			for (int32 w = 0; w < SD.BoneIndices.Num(); w++)
+			{
+				int32 BIdx = SD.BoneIndices[w];
+				if (BIdx >= 0 && BIdx < BoneWorldTransforms.Num() && BIdx < InvRefMats.Num())
+				{
+					FMatrix InvRef = FMatrix(InvRefMats[BIdx]);
+					FVector TransformedPos = InvRef.TransformPosition(FVector(StoredPos));
+					TransformedPos = BoneWorldTransforms[BIdx].TransformPosition(TransformedPos);
+					SkinnedPos += TransformedPos * SD.BoneWeights[w];
+				}
+			}
+
+			FVector Delta = SkinnedPos - FVector(StoredPos);
+			UE_LOG(LogSMSImporter, Warning,
+				TEXT("DEBUG SKIN_TEST[%d] bone=%d stored=(%.2f,%.2f,%.2f) skinned=(%.2f,%.2f,%.2f) delta=(%.4f,%.4f,%.4f) |delta|=%.4f"),
+				TestIdx, SD.BoneIndices.Num() > 0 ? SD.BoneIndices[0] : -1,
+				StoredPos.X, StoredPos.Y, StoredPos.Z,
+				SkinnedPos.X, SkinnedPos.Y, SkinnedPos.Z,
+				Delta.X, Delta.Y, Delta.Z, Delta.Size());
+			TestIdx++;
+		}
+	}
+
+	// Build() handles CacheDerivedData, render resource allocation, and LOD generation
+	SkelMesh->Build();
+
+	// Register assets
+	FAssetRegistryModule::AssetCreated(SkelMesh);
+	MeshPackage->MarkPackageDirty();
+
+	// Save packages
+	{
+		FString Filename = FPackageName::LongPackageNameToFilename(SkelPackagePath, FPackageName::GetAssetPackageExtension());
+		FSavePackageArgs SaveArgs;
+		UPackage::SavePackage(SkelPackage, Skeleton, *Filename, SaveArgs);
+	}
+	{
+		FString Filename = FPackageName::LongPackageNameToFilename(MeshPackagePath, FPackageName::GetAssetPackageExtension());
+		FSavePackageArgs SaveArgs;
+		UPackage::SavePackage(MeshPackage, SkelMesh, *Filename, SaveArgs);
+	}
+
+	// DEBUG: Log mesh bounds after build
+	{
+		FBoxSphereBounds Bounds = SkelMesh->GetBounds();
+		UE_LOG(LogSMSImporter, Warning, TEXT("DEBUG SKEL '%s' BOUNDS: Origin=(%.2f,%.2f,%.2f) Extent=(%.2f,%.2f,%.2f) Radius=%.2f"),
+			*Name,
+			Bounds.Origin.X, Bounds.Origin.Y, Bounds.Origin.Z,
+			Bounds.BoxExtent.X, Bounds.BoxExtent.Y, Bounds.BoxExtent.Z,
+			Bounds.SphereRadius);
+	}
+
+	UE_LOG(LogSMSImporter, Log, TEXT("BMD: Created skeletal mesh '%s' with %d triangles, %d bones, %d material slots"),
+		*Name, TotalTriangles, Model.Joints.Num(), SkelMaterials.Num());
+
+	return SkelMesh;
 }
 
 // ============================================================================

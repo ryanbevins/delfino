@@ -34,7 +34,12 @@ public class SMSLevelImporter : ModuleRules
             "BlueprintGraph",
             "PhysicsCore",
             "RenderCore",
-            "DesktopPlatform"
+            "DesktopPlatform",
+            "SkeletalMeshDescription",
+            "AnimationDataController",
+            "AnimationCore",
+            "MeshBuilder",
+            "TargetPlatform"
         });
     }
 }

@@ -24,9 +24,13 @@ bool FBigEndianStream::CheckBounds(int64 BytesNeeded) const
 {
 	if (Pos + BytesNeeded > DataSize)
 	{
-		UE_LOG(LogTemp, Error,
-			TEXT("FBigEndianStream: Out-of-bounds read at offset %lld (need %lld bytes, size %lld)"),
-			Pos, BytesNeeded, DataSize);
+		if (!bOverflowLogged)
+		{
+			UE_LOG(LogTemp, Warning,
+				TEXT("FBigEndianStream: Out-of-bounds read at offset %lld (need %lld bytes, size %lld)"),
+				Pos, BytesNeeded, DataSize);
+			bOverflowLogged = true;
+		}
 		return false;
 	}
 	return true;

@@ -77,4 +77,5 @@ private:
 	const uint8* Data;
 	int64 DataSize;
 	int64 Pos;
+	mutable bool bOverflowLogged = false;
 };

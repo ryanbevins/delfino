@@ -7,6 +7,8 @@
 
 #include "DesktopPlatformModule.h"
 #include "Widgets/Layout/SScrollBox.h"
+#include "Widgets/Layout/SWidgetSwitcher.h"
+#include "Widgets/Layout/SSeparator.h"
 #include "Widgets/Input/SCheckBox.h"
 #include "Widgets/Input/SSpinBox.h"
 #include "Widgets/Input/SEditableTextBox.h"
@@ -40,19 +42,32 @@ void SSMSImporterWindow::Construct(const FArguments& InArgs)
 			SNew(SSeparator)
 		]
 
-		// Main body: level browser + import options side by side
+		// Tab bar
+		+ SVerticalBox::Slot().AutoHeight().Padding(8, 4, 8, 0)
+		[
+			BuildTabBar()
+		]
+
+		// Tab content area
 		+ SVerticalBox::Slot().FillHeight(1.0f).Padding(8, 4)
 		[
-			SNew(SHorizontalBox)
+			SAssignNew(TabSwitcher, SWidgetSwitcher)
+			.WidgetIndex(0)
 
-			// Level browser (left side)
-			+ SHorizontalBox::Slot().FillWidth(1.0f).Padding(0, 0, 4, 0)
+			// Tab 0: Levels
+			+ SWidgetSwitcher::Slot()
 			[
 				BuildLevelBrowser()
 			]
 
-			// Import options (right side)
-			+ SHorizontalBox::Slot().FillWidth(1.0f).Padding(4, 0, 0, 0)
+			// Tab 1: Characters
+			+ SWidgetSwitcher::Slot()
+			[
+				BuildCharacterBrowser()
+			]
+
+			// Tab 2: Settings
+			+ SWidgetSwitcher::Slot()
 			[
 				BuildImportOptions()
 			]
@@ -95,12 +110,61 @@ TSharedRef<SWidget> SSMSImporterWindow::BuildISOSection()
 		[
 			SNew(SButton)
 			.Text(FText::FromString(TEXT("Browse...")))
-			.OnClicked(FOnClicked::CreateSP(this, &SSMSImporterWindow::OnBrowseISO))
+			.OnClicked_Lambda([this]() { return OnBrowseISO(); })
 		];
 }
 
 // ----------------------------------------------------------------------------
-// UI Builder: Level Browser
+// UI Builder: Tab Bar
+// ----------------------------------------------------------------------------
+
+TSharedRef<SWidget> SSMSImporterWindow::BuildTabBar()
+{
+	auto MakeTabButton = [this](const FString& Label, int32 TabIndex) -> TSharedRef<SWidget>
+	{
+		return SNew(SCheckBox)
+			.Style(FAppStyle::Get(), "ToggleButtonCheckbox")
+			.IsChecked_Lambda([this, TabIndex]()
+			{
+				return ActiveTabIndex == TabIndex ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
+			})
+			.OnCheckStateChanged_Lambda([this, TabIndex](ECheckBoxState)
+			{
+				SetActiveTab(TabIndex);
+			})
+			[
+				SNew(STextBlock)
+				.Text(FText::FromString(Label))
+				.Margin(FMargin(8, 2))
+			];
+	};
+
+	return SNew(SHorizontalBox)
+		+ SHorizontalBox::Slot().AutoWidth().Padding(0, 0, 2, 0)
+		[
+			MakeTabButton(TEXT("Levels"), 0)
+		]
+		+ SHorizontalBox::Slot().AutoWidth().Padding(2, 0)
+		[
+			MakeTabButton(TEXT("Characters"), 1)
+		]
+		+ SHorizontalBox::Slot().AutoWidth().Padding(2, 0)
+		[
+			MakeTabButton(TEXT("Settings"), 2)
+		];
+}
+
+void SSMSImporterWindow::SetActiveTab(int32 TabIndex)
+{
+	ActiveTabIndex = TabIndex;
+	if (TabSwitcher.IsValid())
+	{
+		TabSwitcher->SetActiveWidgetIndex(TabIndex);
+	}
+}
+
+// ----------------------------------------------------------------------------
+// UI Builder: Level Browser (Tab 0)
 // ----------------------------------------------------------------------------
 
 TSharedRef<SWidget> SSMSImporterWindow::BuildLevelBrowser()
@@ -163,7 +227,6 @@ void SSMSImporterWindow::BuildLevelList()
 		// Child checkboxes for each episode
 		if (Level.MaxEpisodes == -1)
 		{
-			// Special archive: single entry, no episodes
 			FString Key = FString::Printf(TEXT("%s:0"), *Level.InternalName);
 			LevelListBox->AddSlot().AutoHeight().Padding(20, 1, 2, 1)
 			[
@@ -171,9 +234,10 @@ void SSMSImporterWindow::BuildLevelList()
 				+ SHorizontalBox::Slot().AutoWidth().Padding(2)
 				[
 					SNew(SCheckBox)
-					.OnCheckStateChanged(
-						SCheckBox::FOnCheckStateChanged::CreateSP(
-							this, &SSMSImporterWindow::OnLevelCheckChanged, Key))
+					.OnCheckStateChanged_Lambda([this, Key](ECheckBoxState State)
+					{
+						OnLevelCheckChanged(State, Key);
+					})
 				]
 				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2)
 				[
@@ -195,9 +259,10 @@ void SSMSImporterWindow::BuildLevelList()
 					+ SHorizontalBox::Slot().AutoWidth().Padding(2)
 					[
 						SNew(SCheckBox)
-						.OnCheckStateChanged(
-							SCheckBox::FOnCheckStateChanged::CreateSP(
-								this, &SSMSImporterWindow::OnLevelCheckChanged, Key))
+						.OnCheckStateChanged_Lambda([this, Key](ECheckBoxState State)
+						{
+							OnLevelCheckChanged(State, Key);
+						})
 					]
 					+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2)
 					[
@@ -211,7 +276,116 @@ void SSMSImporterWindow::BuildLevelList()
 }
 
 // ----------------------------------------------------------------------------
-// UI Builder: Import Options
+// UI Builder: Character Browser (Tab 1)
+// ----------------------------------------------------------------------------
+
+TSharedRef<SWidget> SSMSImporterWindow::BuildCharacterBrowser()
+{
+	return SNew(SBorder)
+		.BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
+		.Padding(4)
+		[
+			SNew(SVerticalBox)
+
+			+ SVerticalBox::Slot().AutoHeight().Padding(4)
+			[
+				SNew(STextBlock)
+				.Text(FText::FromString(TEXT("Characters")))
+				.Font(FCoreStyle::GetDefaultFontStyle("Bold", 12))
+			]
+
+			+ SVerticalBox::Slot().FillHeight(1.0f).Padding(4)
+			[
+				SNew(SScrollBox)
+				+ SScrollBox::Slot()
+				[
+					SAssignNew(CharacterListBox, SVerticalBox)
+				]
+			]
+		];
+}
+
+void SSMSImporterWindow::BuildCharacterList()
+{
+	if (!CharacterListBox.IsValid())
+	{
+		return;
+	}
+
+	CharacterListBox->ClearChildren();
+
+	if (AvailableCharacters.Num() == 0)
+	{
+		CharacterListBox->AddSlot().AutoHeight().Padding(4)
+		[
+			SNew(STextBlock)
+			.Text(FText::FromString(TEXT("No character archives found.\nOpen an ISO to scan for characters.")))
+			.ColorAndOpacity(FSlateColor(FLinearColor(0.5f, 0.5f, 0.5f)))
+		];
+		return;
+	}
+
+	for (const FSMSCharacterInfo& Character : AvailableCharacters)
+	{
+		FString ArchivePath = Character.ArchivePath;
+
+		// Parent checkbox for the character
+		CharacterListBox->AddSlot().AutoHeight().Padding(2)
+		[
+			SNew(SHorizontalBox)
+			+ SHorizontalBox::Slot().AutoWidth().Padding(2)
+			[
+				SNew(SCheckBox)
+				.IsChecked_Lambda([this, ArchivePath]()
+				{
+					return SelectedCharacters.Contains(ArchivePath) ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
+				})
+				.OnCheckStateChanged_Lambda([this, ArchivePath](ECheckBoxState State)
+				{
+					OnCharacterCheckChanged(State, ArchivePath);
+				})
+			]
+			+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2)
+			[
+				SNew(STextBlock)
+				.Text(FText::FromString(Character.DisplayName))
+				.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
+			]
+		];
+
+		// Child checkboxes for each BCK animation
+		for (const FString& BckPath : Character.BckFiles)
+		{
+			FString BckFilename = FPaths::GetCleanFilename(BckPath);
+
+			CharacterListBox->AddSlot().AutoHeight().Padding(20, 1, 2, 1)
+			[
+				SNew(SHorizontalBox)
+				+ SHorizontalBox::Slot().AutoWidth().Padding(2)
+				[
+					SNew(SCheckBox)
+					.IsChecked_Lambda([this, ArchivePath, BckPath]()
+					{
+						const TSet<FString>* Bcks = SelectedBcks.Find(ArchivePath);
+						return (Bcks && Bcks->Contains(BckPath)) ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
+					})
+					.OnCheckStateChanged_Lambda([this, ArchivePath, BckPath](ECheckBoxState State)
+					{
+						OnBckCheckChanged(State, ArchivePath, BckPath);
+					})
+				]
+				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2)
+				[
+					SNew(STextBlock)
+					.Text(FText::FromString(BckFilename))
+				]
+			];
+		}
+	}
+}
+
+// ----------------------------------------------------------------------------
+// UI Builder: Import Options (Tab 2 — Settings)
 // ----------------------------------------------------------------------------
 
 TSharedRef<SWidget> SSMSImporterWindow::BuildImportOptions()
@@ -355,7 +529,7 @@ TSharedRef<SWidget> SSMSImporterWindow::BuildProgressSection()
 			SAssignNew(ImportButton, SButton)
 			.Text(FText::FromString(TEXT("Import Selected")))
 			.HAlign(HAlign_Center)
-			.OnClicked(FOnClicked::CreateSP(this, &SSMSImporterWindow::OnImportClicked))
+			.OnClicked_Lambda([this]() { return OnImportClicked(); })
 		]
 
 		// Progress bar
@@ -411,12 +585,19 @@ void SSMSImporterWindow::OnISOSelected(const FString& Path)
 	SceneLoader = MakeShared<FSMSSceneLoader>();
 	if (SceneLoader->OpenISO(Path))
 	{
+		// Populate level list
 		AvailableLevels = SceneLoader->GetAvailableLevels();
 		SelectedScenes.Empty();
 		BuildLevelList();
 
-		UE_LOG(LogSMSImporter, Log, TEXT("Opened ISO: %s — Region: %s, %d levels available"),
-			*Path, *SceneLoader->GetRegion(), AvailableLevels.Num());
+		// Scan for character archives
+		AvailableCharacters = SceneLoader->ScanCharacterArchives();
+		SelectedCharacters.Empty();
+		SelectedBcks.Empty();
+		BuildCharacterList();
+
+		UE_LOG(LogSMSImporter, Log, TEXT("Opened ISO: %s — Region: %s, %d levels, %d characters"),
+			*Path, *SceneLoader->GetRegion(), AvailableLevels.Num(), AvailableCharacters.Num());
 	}
 	else
 	{
@@ -424,13 +605,25 @@ void SSMSImporterWindow::OnISOSelected(const FString& Path)
 		SceneLoader.Reset();
 		AvailableLevels.Empty();
 		SelectedScenes.Empty();
+		AvailableCharacters.Empty();
+		SelectedCharacters.Empty();
+		SelectedBcks.Empty();
 		BuildLevelList();
+		BuildCharacterList();
 	}
 }
 
 FReply SSMSImporterWindow::OnImportClicked()
 {
-	if (bIsImporting || !SceneLoader.IsValid() || SelectedScenes.Num() == 0)
+	if (bIsImporting || !SceneLoader.IsValid())
+	{
+		return FReply::Handled();
+	}
+
+	const bool bHasLevels = SelectedScenes.Num() > 0;
+	const bool bHasCharacters = SelectedCharacters.Num() > 0;
+
+	if (!bHasLevels && !bHasCharacters)
 	{
 		return FReply::Handled();
 	}
@@ -441,19 +634,64 @@ FReply SSMSImporterWindow::OnImportClicked()
 	StatusText->SetText(FText::FromString(TEXT("Starting import...")));
 	ProgressBar->SetPercent(0.0f);
 
-	// Import each selected scene sequentially
+	const int32 TotalItems = SelectedScenes.Num() + SelectedCharacters.Num();
+	int32 CurrentItem = 0;
+
+	// Import selected levels
 	for (const FString& Key : SelectedScenes)
 	{
 		FString LevelName, EpisodeStr;
 		Key.Split(TEXT(":"), &LevelName, &EpisodeStr);
 		int32 Episode = FCString::Atoi(*EpisodeStr);
 
-		SceneLoader->ImportScene(LevelName, Episode, ImportOptions,
-			FOnSMSImportProgress::CreateSP(this, &SSMSImporterWindow::OnImportProgress));
+		// Scale progress per item
+		auto PerItemProgress = FOnSMSImportProgress::CreateLambda(
+			[this, CurrentItem, TotalItems](float SubProgress, const FString& Message)
+		{
+			float OverallProgress = (static_cast<float>(CurrentItem) + SubProgress) / FMath::Max(1, TotalItems);
+			OnImportProgress(OverallProgress, Message);
+		});
+
+		SceneLoader->ImportScene(LevelName, Episode, ImportOptions, PerItemProgress);
 
 		if (SceneLoader->IsCancelled())
 		{
 			break;
+		}
+		CurrentItem++;
+	}
+
+	// Import selected characters
+	if (!SceneLoader->IsCancelled())
+	{
+		for (const FSMSCharacterInfo& Character : AvailableCharacters)
+		{
+			if (!SelectedCharacters.Contains(Character.ArchivePath))
+			{
+				continue;
+			}
+
+			// Get selected BCKs for this character
+			TSet<FString> CharBcks;
+			if (const TSet<FString>* BckSet = SelectedBcks.Find(Character.ArchivePath))
+			{
+				CharBcks = *BckSet;
+			}
+
+			auto PerItemProgress = FOnSMSImportProgress::CreateLambda(
+				[this, CurrentItem, TotalItems](float SubProgress, const FString& Message)
+			{
+				float OverallProgress = (static_cast<float>(CurrentItem) + SubProgress) / FMath::Max(1, TotalItems);
+				OnImportProgress(OverallProgress, Message);
+			});
+
+			SceneLoader->ImportCharacter(Character, CharBcks, ImportOptions, PerItemProgress);
+
+			if (SceneLoader->IsCancelled())
+			{
+				break;
+			}
+			CurrentItem++;
 		}
 	}
 
@@ -496,14 +734,12 @@ void SSMSImporterWindow::OnLevelCheckChanged(ECheckBoxState State, FString Key)
 
 void SSMSImporterWindow::OnLevelGroupCheckChanged(ECheckBoxState State, FString InternalName)
 {
-	// Find the level info for this internal name
 	for (const FSMSLevelInfo& Level : AvailableLevels)
 	{
 		if (Level.InternalName == InternalName)
 		{
 			if (Level.MaxEpisodes == -1)
 			{
-				// Special archive: single scene
 				FString Key = FString::Printf(TEXT("%s:0"), *InternalName);
 				if (State == ECheckBoxState::Checked)
 				{
@@ -516,7 +752,6 @@ void SSMSImporterWindow::OnLevelGroupCheckChanged(ECheckBoxState State, FString 
 			}
 			else
 			{
-				// Toggle all episodes
 				for (int32 Ep = 0; Ep < Level.MaxEpisodes; ++Ep)
 				{
 					FString Key = FString::Printf(TEXT("%s:%d"), *InternalName, Ep);
@@ -531,6 +766,55 @@ void SSMSImporterWindow::OnLevelGroupCheckChanged(ECheckBoxState State, FString 
 				}
 			}
 			break;
+		}
+	}
+}
+
+void SSMSImporterWindow::OnCharacterCheckChanged(ECheckBoxState State, FString ArchivePath)
+{
+	if (State == ECheckBoxState::Checked)
+	{
+		SelectedCharacters.Add(ArchivePath);
+
+		// Also select all BCK files for this character
+		for (const FSMSCharacterInfo& Character : AvailableCharacters)
+		{
+			if (Character.ArchivePath == ArchivePath)
+			{
+				TSet<FString>& Bcks = SelectedBcks.FindOrAdd(ArchivePath);
+				for (const FString& BckPath : Character.BckFiles)
+				{
+					Bcks.Add(BckPath);
+				}
+				break;
+			}
+		}
+	}
+	else
+	{
+		SelectedCharacters.Remove(ArchivePath);
+		SelectedBcks.Remove(ArchivePath);
+	}
+}
+
+void SSMSImporterWindow::OnBckCheckChanged(ECheckBoxState State, FString ArchivePath, FString BckPath)
+{
+	TSet<FString>& Bcks = SelectedBcks.FindOrAdd(ArchivePath);
+
+	if (State == ECheckBoxState::Checked)
+	{
+		Bcks.Add(BckPath);
+		// Also ensure the parent character is selected
+		SelectedCharacters.Add(ArchivePath);
+	}
+	else
+	{
+		Bcks.Remove(BckPath);
+		// If no BCKs remain selected, deselect the character
+		if (Bcks.Num() == 0)
+		{
+			SelectedCharacters.Remove(ArchivePath);
+			SelectedBcks.Remove(ArchivePath);
 		}
 	}
 }

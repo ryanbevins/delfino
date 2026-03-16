@@ -1,0 +1,17 @@
+# UE5 build artifacts
+Plugins/*/Binaries/
+Plugins/*/Intermediate/
+
+# IDE
+.vs/
+.vscode/
+*.sln
+*.suo
+*.user
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Superpowers plans/specs (local dev notes)
+docs/superpowers/

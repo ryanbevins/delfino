@@ -825,7 +825,7 @@ void FSMSObjectFactory::SpawnObjectsInLevel(UWorld* World,
 		SpawnTransform.SetScale3D(Placement.Scale);
 
 		AActor* SpawnedActor = World->SpawnActor<AActor>(
-			BP->GeneratedClass, &SpawnTransform, SpawnParams);
+			BP->GeneratedClass, SpawnTransform, SpawnParams);
 
 		if (!SpawnedActor)
 		{
@@ -855,15 +855,15 @@ void FSMSObjectFactory::SpawnObjectsInLevel(UWorld* World,
 		// Also try matching by model name
 		else if (!Placement.ModelName.IsEmpty())
 		{
-			if (const UStaticMesh* const* FoundMesh = ObjectMeshes.Find(Placement.ModelName))
+			if (const UStaticMesh* const* FoundMeshByModel = ObjectMeshes.Find(Placement.ModelName))
 			{
-				if (*FoundMesh)
+				if (*FoundMeshByModel)
 				{
 					TArray<UStaticMeshComponent*> MeshComps;
 					SpawnedActor->GetComponents<UStaticMeshComponent>(MeshComps);
 					if (MeshComps.Num() > 0)
 					{
-						MeshComps[0]->SetStaticMesh(const_cast<UStaticMesh*>(*FoundMesh));
+						MeshComps[0]->SetStaticMesh(const_cast<UStaticMesh*>(*FoundMeshByModel));
 					}
 				}
 			}
@@ -939,7 +939,7 @@ int32 FSMSObjectFactory::RemapObjectType(UWorld* World, const FString& OldClassN
 			ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
 
 		AActor* NewActor = World->SpawnActor<AActor>(
-			NewClass, &Record.Transform, SpawnParams);
+			NewClass, Record.Transform, SpawnParams);
 
 		if (NewActor)
 		{

@@ -16,6 +16,7 @@ class FBigEndianStream;
 
 namespace BMDMagic
 {
+	static constexpr uint32 J3D1 = 0x4A334431;
 	static constexpr uint32 J3D2 = 0x4A334432;
 	static constexpr uint32 INF1 = 0x494E4631;
 	static constexpr uint32 VTX1 = 0x56545831;
@@ -104,18 +105,22 @@ struct FBMDVertex
 	bool bHasColor0 = false;
 	bool bHasColor1 = false;
 	uint8 NumTexCoords = 0;
+	uint8 PosMatIdx = 0;  // PNMTXIDX from display list (for skinning)
+	int32 PosIndex = -1;  // Original VTX1 position index (for vertex sharing)
 };
 
 /** A primitive is a triangle list (every 3 vertices = one triangle). */
 struct FBMDPrimitive
 {
 	TArray<FBMDVertex> Vertices;
+	int32 BatchIndex = 0;  // Which SHP1 batch this primitive came from
 };
 
 struct FBMDShape
 {
 	TArray<FBMDPrimitive> Primitives;
 	int32 MaterialIndex = -1;
+	TArray<TArray<uint16>> BatchMatrixTables;  // Per-batch DRW1 index arrays
 };
 
 struct FBMDMaterial
@@ -140,6 +145,39 @@ struct FBMDTextureEntry
 	TArray<uint8> RGBA8Pixels;          // Decoded pixel data (W*H*4)
 };
 
+// ---- Skinning data (EVP1 / DRW1) ----
+
+struct FBMDEnvelope
+{
+	TArray<uint16> BoneIndices;   // JNT1 joint indices
+	TArray<float> Weights;        // Corresponding weights (sum to 1.0)
+};
+
+struct FBMDEVP1Data
+{
+	TArray<FBMDEnvelope> Envelopes;
+	TArray<FMatrix44f> InverseBindMatrices;  // One per joint (3x4 -> 4x4)
+};
+
+struct FBMDDRW1Data
+{
+	TArray<uint8> IsWeighted;   // 0=rigid (JNT1), 1=weighted (EVP1)
+	TArray<uint16> Indices;     // Into JNT1 or EVP1 depending on flag
+};
+
+// ---- Joint data (JNT1) ----
+
+struct FBMDJoint
+{
+	FString Name;
+	FVector3f Scale = FVector3f(1.f, 1.f, 1.f);
+	FVector3f Rotation = FVector3f::ZeroVector;  // Euler XYZ (degrees)
+	FVector3f Translation = FVector3f::ZeroVector;
+	FMatrix44f LocalMatrix = FMatrix44f::Identity;
+	FMatrix44f WorldMatrix = FMatrix44f::Identity;
+	int32 ParentIndex = -1;
+};
+
 /** Complete parsed BMD model. */
 struct FBMDModel
 {
@@ -150,10 +188,21 @@ struct FBMDModel
 
 	/** INF1 scene graph mapping: shape index -> material index */
 	TMap<int32, int32> ShapeToMaterial;
+
+	/** Skinning data */
+	FBMDEVP1Data EVP1;
+	FBMDDRW1Data DRW1;
+	bool bHasSkinning = false;
+
+	/** Joint hierarchy */
+	TArray<FBMDJoint> Joints;
+	TArray<FString> JointNames;
 };
 
 // Forward declarations for UE5 asset types
 class UStaticMesh;
+class USkeletalMesh;
+class USkeleton;
 class UMaterial;
 class UMaterialInstanceConstant;
 
@@ -188,6 +237,18 @@ public:
 	static UStaticMesh* CreateStaticMesh(UObject* Outer, const FString& Name,
 		const FBMDModel& Model, const FString& AssetPath);
 
+	/**
+	 * Create USkeletalMesh from parsed BMD model that has skinning data.
+	 * Also creates the USkeleton and materials.
+	 * @param Outer     Outer object for transient ownership.
+	 * @param Name      Base name for the mesh asset.
+	 * @param Model     Parsed BMD model data with EVP1/DRW1 skinning.
+	 * @param AssetPath Base content path.
+	 * @return The created USkeletalMesh, or nullptr on failure.
+	 */
+	static USkeletalMesh* CreateSkeletalMesh(UObject* Outer, const FString& Name,
+		const FBMDModel& Model, const FString& AssetPath);
+
 private:
 	/** Create a base material asset (parent for all material instances). */
 	static UMaterial* GetOrCreateBaseMaterial(const FString& AssetPath);
@@ -210,7 +271,12 @@ private:
 	static bool ParseTEX1(FBigEndianStream& Stream, const FBMDBlock& Block,
 		TArray<FBMDTextureEntry>& OutTextures);
 	static bool ParseINF1(FBigEndianStream& Stream, const FBMDBlock& Block,
-		TMap<int32, int32>& OutShapeToMaterial);
+		TMap<int32, int32>& OutShapeToMaterial, TArray<FBMDJoint>& OutJoints);
+
+	static bool ParseEVP1(FBigEndianStream& Stream, const FBMDBlock& Block, FBMDEVP1Data& OutEVP1);
+	static bool ParseDRW1(FBigEndianStream& Stream, const FBMDBlock& Block, FBMDDRW1Data& OutDRW1);
+	static bool ParseJNT1(FBigEndianStream& Stream, const FBMDBlock& Block,
+		TArray<FBMDJoint>& OutJoints, TArray<FString>& OutJointNames);
 
 	// GX display list decoding
 	struct FVtxAttrDesc

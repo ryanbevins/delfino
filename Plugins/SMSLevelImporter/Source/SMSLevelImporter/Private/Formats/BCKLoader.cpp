@@ -1,14 +1,21 @@
 // BCKLoader.cpp - J3D skeletal (joint) transform animation parser (BCK / ANK1)
 
 #include "Formats/BCKLoader.h"
+#include "Formats/BMDLoader.h"
 #include "Util/BigEndianStream.h"
+#include "SMSLevelImporterModule.h"
 
-DECLARE_LOG_CATEGORY_EXTERN(LogSMSImporter, Log, All);
+#include "Animation/AnimSequence.h"
+#include "Animation/Skeleton.h"
+#include "Animation/AnimData/IAnimationDataController.h"
+#include "AssetRegistry/AssetRegistryModule.h"
+#include "UObject/SavePackage.h"
 
 // ----------------------------------------------------------------------------
 // Constants
 // ----------------------------------------------------------------------------
 
+static constexpr uint32 J3D1Magic = 0x4A334431; // "J3D1"
 static constexpr uint32 J3D2Magic = 0x4A334432; // "J3D2"
 static constexpr uint32 ANK1Magic = 0x414E4B31; // "ANK1"
 
@@ -71,7 +78,8 @@ static TArray<FSimpleKeyframe> ReadKeyframesS16(
 	uint8 RotFrac)
 {
 	TArray<FSimpleKeyframe> Result;
-	const float Scale = 180.0f / static_cast<float>(1 << RotFrac);
+	// J3D rotation: degrees = s16_value * (2^RotFrac) * (180/32768)
+	const float Scale = static_cast<float>(1 << RotFrac) * (180.0f / 32768.0f);
 
 	if (Count == 0)
 	{
@@ -120,7 +128,7 @@ bool FBCKLoader::Parse(const TArray<uint8>& Data, FBCKAnimation& OutAnim)
 
 	// --- J3D file header ---
 	const uint32 Magic = Stream.ReadU32();
-	if (Magic != J3D2Magic)
+	if (Magic != J3D1Magic && Magic != J3D2Magic)
 	{
 		UE_LOG(LogSMSImporter, Error, TEXT("BCKLoader: Invalid J3D magic 0x%08X."), Magic);
 		return false;
@@ -202,4 +210,166 @@ bool FBCKLoader::Parse(const TArray<uint8>& Data, FBCKAnimation& OutAnim)
 	UE_LOG(LogSMSImporter, Log, TEXT("BCKLoader: Parsed %d joint anims, %d frames, rotFrac=%d."),
 		OutAnim.JointAnims.Num(), OutAnim.FrameCount, OutAnim.RotationFrac);
 	return true;
+}
+
+// ----------------------------------------------------------------------------
+// SampleKeyframes — Linear interpolation between bracketing keyframes
+// ----------------------------------------------------------------------------
+
+float FBCKLoader::SampleKeyframes(const TArray<FSimpleKeyframe>& Keys, float Frame)
+{
+	if (Keys.Num() == 0) return 0.0f;
+	if (Keys.Num() == 1) return Keys[0].Value;
+
+	// Before first key
+	if (Frame <= Keys[0].Time) return Keys[0].Value;
+
+	// After last key
+	if (Frame >= Keys.Last().Time) return Keys.Last().Value;
+
+	// Find bracketing keyframes
+	for (int32 i = 0; i + 1 < Keys.Num(); i++)
+	{
+		if (Frame >= Keys[i].Time && Frame <= Keys[i + 1].Time)
+		{
+			const float Span = Keys[i + 1].Time - Keys[i].Time;
+			if (Span <= 0.0f) return Keys[i].Value;
+			const float Alpha = (Frame - Keys[i].Time) / Span;
+			return FMath::Lerp(Keys[i].Value, Keys[i + 1].Value, Alpha);
+		}
+	}
+
+	return Keys.Last().Value;
+}
+
+// ----------------------------------------------------------------------------
+// CreateAnimSequence — Build UE5 UAnimSequence from parsed BCK animation
+// ----------------------------------------------------------------------------
+
+UAnimSequence* FBCKLoader::CreateAnimSequence(USkeleton* Skeleton,
+	const FBCKAnimation& Anim, const TArray<FBMDJoint>& Joints,
+	const TArray<FString>& JointNames,
+	const FString& AnimName, const FString& AssetPath)
+{
+	if (!Skeleton)
+	{
+		UE_LOG(LogSMSImporter, Error, TEXT("BCKLoader: Cannot create AnimSequence without skeleton"));
+		return nullptr;
+	}
+
+	FString AnimPackagePath = FString::Printf(TEXT("%s/Animations/ANIM_%s"), *AssetPath, *AnimName);
+	UPackage* AnimPackage = CreatePackage(*AnimPackagePath);
+	AnimPackage->FullyLoad();
+
+	UAnimSequence* AnimSeq = NewObject<UAnimSequence>(AnimPackage,
+		*FString::Printf(TEXT("ANIM_%s"), *AnimName), RF_Public | RF_Standalone);
+
+	AnimSeq->SetSkeleton(Skeleton);
+
+	const float FrameRate = 30.0f;
+	const int32 NumFrames = FMath::Max(1, Anim.FrameCount);
+	const float SequenceLength = static_cast<float>(NumFrames) / FrameRate;
+
+	IAnimationDataController& Controller = AnimSeq->GetController();
+	Controller.InitializeModel();
+	Controller.OpenBracket(FText::FromString(TEXT("BCK Import")), false);
+	Controller.SetFrameRate(FFrameRate(static_cast<uint32>(FrameRate), 1), false);
+	Controller.SetNumberOfFrames(FFrameNumber(NumFrames), false);
+
+	// For each joint that has animation data
+	const int32 NumJoints = FMath::Min(Anim.JointAnims.Num(),
+		FMath::Min(Joints.Num(), JointNames.Num()));
+
+	for (int32 i = 0; i < NumJoints; i++)
+	{
+		const FBCKJointAnim& JointAnim = Anim.JointAnims[i];
+		FName BoneName(*JointNames[i]);
+
+		// Check if bone exists in skeleton
+		const FReferenceSkeleton& RefSkel = Skeleton->GetReferenceSkeleton();
+		if (RefSkel.FindBoneIndex(BoneName) == INDEX_NONE)
+		{
+			continue;
+		}
+
+		// Sample keyframes per frame
+		TArray<FVector3f> PosKeys;
+		TArray<FQuat4f> RotKeys;
+		TArray<FVector3f> ScaleKeys;
+
+		PosKeys.SetNum(NumFrames);
+		RotKeys.SetNum(NumFrames);
+		ScaleKeys.SetNum(NumFrames);
+
+		for (int32 Frame = 0; Frame < NumFrames; Frame++)
+		{
+			const float F = static_cast<float>(Frame);
+
+			// Sample SRT in GC space
+			float TX = SampleKeyframes(JointAnim.TranslationX, F);
+			float TY = SampleKeyframes(JointAnim.TranslationY, F);
+			float TZ = SampleKeyframes(JointAnim.TranslationZ, F);
+
+			float RX = SampleKeyframes(JointAnim.RotationX, F);
+			float RY = SampleKeyframes(JointAnim.RotationY, F);
+			float RZ = SampleKeyframes(JointAnim.RotationZ, F);
+
+			float SX = SampleKeyframes(JointAnim.ScaleX, F);
+			float SY = SampleKeyframes(JointAnim.ScaleY, F);
+			float SZ = SampleKeyframes(JointAnim.ScaleZ, F);
+
+			// Build GC-space local transform (extrinsic ZYX = Rz * Ry * Rx)
+			const float RXr = FMath::DegreesToRadians(RX);
+			const float RYr = FMath::DegreesToRadians(RY);
+			const float RZr = FMath::DegreesToRadians(RZ);
+
+			FQuat QX(FVector::XAxisVector, RXr);
+			FQuat QY(FVector::YAxisVector, RYr);
+			FQuat QZ(FVector::ZAxisVector, RZr);
+			FQuat GCQuat = QZ * QY * QX;
+
+			FTransform GCTransform(GCQuat, FVector(TX, TY, TZ), FVector(SX, SY, SZ));
+			FMatrix44f GCMat = FMatrix44f(GCTransform.ToMatrixWithScale());
+
+			// Convert GC→UE via matrix sandwich (swap rows 1↔2, cols 1↔2)
+			for (int32 c = 0; c < 4; c++)
+			{
+				float Tmp = GCMat.M[1][c];
+				GCMat.M[1][c] = GCMat.M[2][c];
+				GCMat.M[2][c] = Tmp;
+			}
+			for (int32 r = 0; r < 4; r++)
+			{
+				float Tmp = GCMat.M[r][1];
+				GCMat.M[r][1] = GCMat.M[r][2];
+				GCMat.M[r][2] = Tmp;
+			}
+
+			FTransform UETransform;
+			UETransform.SetFromMatrix(FMatrix(GCMat));
+
+			PosKeys[Frame] = FVector3f(UETransform.GetTranslation());
+			RotKeys[Frame] = FQuat4f(UETransform.GetRotation());
+			ScaleKeys[Frame] = FVector3f(UETransform.GetScale3D());
+		}
+
+		Controller.AddBoneCurve(BoneName, false);
+		Controller.SetBoneTrackKeys(BoneName, PosKeys, RotKeys, ScaleKeys, false);
+	}
+
+	Controller.CloseBracket(false);
+	Controller.NotifyPopulated();
+
+	// Register and save
+	FAssetRegistryModule::AssetCreated(AnimSeq);
+	AnimPackage->MarkPackageDirty();
+
+	FString Filename = FPackageName::LongPackageNameToFilename(AnimPackagePath, FPackageName::GetAssetPackageExtension());
+	FSavePackageArgs SaveArgs;
+	UPackage::SavePackage(AnimPackage, AnimSeq, *Filename, SaveArgs);
+
+	UE_LOG(LogSMSImporter, Log, TEXT("BCKLoader: Created AnimSequence '%s' (%d frames, %d bone tracks)"),
+		*AnimName, NumFrames, NumJoints);
+
+	return AnimSeq;
 }

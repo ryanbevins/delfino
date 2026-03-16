@@ -5,9 +5,11 @@
 
 #include "ISO/GCISOReader.h"
 #include "ISO/YAZ0Decoder.h"
+#include "Util/BigEndianStream.h"
 #include "Archive/RARCArchive.h"
 #include "Formats/BMDLoader.h"
 #include "Formats/BTILoader.h"
+#include "Formats/BCKLoader.h"
 #include "Formats/COLLoader.h"
 #include "Formats/BTKLoader.h"
 #include "Formats/BTPLoader.h"
@@ -16,6 +18,8 @@
 #include "Scene/SMSLevelDefinitions.h"
 
 #include "Engine/StaticMeshActor.h"
+#include "Engine/SkeletalMesh.h"
+#include "Animation/Skeleton.h"
 #include "Engine/World.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "UObject/SavePackage.h"
@@ -475,6 +479,301 @@ UWorld* FSMSSceneLoader::CreateLevelMap(const FString& LevelName, int32 Episode,
 
 	return World;
 }
+
+// ---- Character scanning and import ----
+
+TArray<FSMSCharacterInfo> FSMSSceneLoader::ScanCharacterArchives()
+{
+	TArray<FSMSCharacterInfo> Characters;
+
+	if (!ISOReader.IsValid())
+	{
+		return Characters;
+	}
+
+	// Get all known level paths to exclude
+	TSet<FString> LevelPaths;
+	TArray<FSMSLevelInfo> AllLevels = FSMSLevelDefinitions::GetAllLevels();
+	for (const FSMSLevelInfo& Level : AllLevels)
+	{
+		if (Level.MaxEpisodes == -1)
+		{
+			LevelPaths.Add(FSMSLevelDefinitions::GetScenePath(Level.InternalName, 0).ToLower());
+		}
+		else
+		{
+			for (int32 Ep = 0; Ep < Level.MaxEpisodes; Ep++)
+			{
+				LevelPaths.Add(FSMSLevelDefinitions::GetScenePath(Level.InternalName, Ep).ToLower());
+			}
+		}
+	}
+
+	// Enumerate all .szs files in the ISO
+	TArray<FString> AllFiles = ISOReader->ListFiles();
+	for (const FString& FilePath : AllFiles)
+	{
+		if (!FilePath.EndsWith(TEXT(".szs"), ESearchCase::IgnoreCase))
+		{
+			continue;
+		}
+
+		// Skip known level archives
+		if (LevelPaths.Contains(FilePath.ToLower()))
+		{
+			continue;
+		}
+
+		// Try to decompress and scan this archive
+		TArray<uint8> CompressedData = ISOReader->ReadFile(FilePath);
+		if (CompressedData.Num() == 0)
+		{
+			continue;
+		}
+
+		if (!FYAZ0Decoder::IsYAZ0(CompressedData))
+		{
+			continue;
+		}
+
+		TArray<uint8> DecompressedData = FYAZ0Decoder::Decode(CompressedData);
+		if (DecompressedData.Num() == 0)
+		{
+			continue;
+		}
+
+		FRARCArchive Archive;
+		if (!Archive.Parse(DecompressedData))
+		{
+			continue;
+		}
+
+		// Check for BMD files with EVP1 block (skinning data)
+		TArray<FString> BmdFiles = Archive.FindFiles(TEXT(".bmd"));
+		bool bHasSkinning = false;
+
+		for (const FString& BmdPath : BmdFiles)
+		{
+			TArray<uint8> BmdData = Archive.GetFile(BmdPath);
+			if (BmdData.Num() < 0x20)
+			{
+				continue;
+			}
+
+			// Quick scan: look for EVP1 block magic in the file
+			FBigEndianStream Stream(BmdData);
+			uint32 Magic = Stream.ReadU32();
+			if (Magic != 0x4A334431 && Magic != 0x4A334432) // J3D1 or J3D2
+			{
+				continue;
+			}
+
+			// Scan blocks for EVP1
+			Stream.Skip(4); // type
+			Stream.Skip(4); // file size
+			uint32 BlockCount = Stream.ReadU32();
+			Stream.Skip(16); // padding to 0x20
+
+			for (uint32 b = 0; b < BlockCount && !Stream.IsEOF(); b++)
+			{
+				int64 BlockStart = Stream.Tell();
+				if (BlockStart + 8 > Stream.Size()) break;
+				uint32 BlockMagic = Stream.ReadU32();
+				uint32 BlockSize = Stream.ReadU32();
+				if (BlockMagic == 0x45565031) // EVP1
+				{
+					bHasSkinning = true;
+					break;
+				}
+				if (BlockSize < 8) break;
+				Stream.Seek(BlockStart + BlockSize);
+			}
+
+			if (bHasSkinning) break;
+		}
+
+		// Only include archives that have skinning or BCK animations
+		TArray<FString> BckFiles = Archive.FindFiles(TEXT(".bck"));
+		if (!bHasSkinning && BckFiles.Num() == 0)
+		{
+			continue;
+		}
+
+		// Build display name from filename
+		FString FileName = FPaths::GetBaseFilename(FilePath);
+		// Capitalize first letter
+		if (FileName.Len() > 0)
+		{
+			FileName[0] = FChar::ToUpper(FileName[0]);
+		}
+
+		FSMSCharacterInfo CharInfo;
+		CharInfo.ArchivePath = FilePath;
+		CharInfo.DisplayName = FileName;
+		CharInfo.BckFiles = BckFiles;
+		CharInfo.bHasSkinning = bHasSkinning;
+
+		Characters.Add(CharInfo);
+
+		UE_LOG(LogSMSImporter, Log, TEXT("Found character archive: %s (%d BCK files, skinning=%s)"),
+			*FilePath, BckFiles.Num(), bHasSkinning ? TEXT("yes") : TEXT("no"));
+	}
+
+	UE_LOG(LogSMSImporter, Log, TEXT("Character scan complete: %d character archives found"), Characters.Num());
+	return Characters;
+}
+
+void FSMSSceneLoader::ImportCharacter(const FSMSCharacterInfo& Character,
+	const TSet<FString>& SelectedBckFiles,
+	const FSMSImportOptions& Options,
+	FOnSMSImportProgress ProgressCallback)
+{
+	if (!ISOReader.IsValid())
+	{
+		UE_LOG(LogSMSImporter, Error, TEXT("No ISO open for character import"));
+		return;
+	}
+
+	ReportProgress(ProgressCallback, 0.0f,
+		FString::Printf(TEXT("Loading character: %s"), *Character.DisplayName));
+
+	// Load and decompress the archive
+	FRARCArchive Archive;
+	if (!LoadAndDecompressScene(Character.ArchivePath, Archive))
+	{
+		UE_LOG(LogSMSImporter, Error, TEXT("Failed to load character archive: %s"), *Character.ArchivePath);
+		return;
+	}
+
+	if (bCancelRequested) return;
+
+	FString CharAssetPath = FString::Printf(TEXT("%s/Characters/%s"),
+		*Options.OutputDirectory, *Character.DisplayName);
+
+	// Find and parse the BMD file — select the best one for the character
+	TArray<FString> BmdFiles = Archive.FindFiles(TEXT(".bmd"));
+	if (BmdFiles.Num() == 0)
+	{
+		UE_LOG(LogSMSImporter, Warning, TEXT("No BMD files in character archive: %s"), *Character.ArchivePath);
+		return;
+	}
+
+	ReportProgress(ProgressCallback, 0.1f, TEXT("Selecting best model..."));
+
+	// Strategy: try to find a BMD named after the archive, otherwise pick the one with most joints
+	FString ArchiveBaseName = FPaths::GetBaseFilename(Character.ArchivePath).ToLower();
+	FString BestBmdPath;
+	FBMDModel BestModel;
+	int32 BestJointCount = -1;
+
+	for (const FString& BmdPath : BmdFiles)
+	{
+		TArray<uint8> BmdData = Archive.GetFile(BmdPath);
+		if (BmdData.Num() == 0) continue;
+
+		FBMDModel CandidateModel;
+		if (!FBMDLoader::Parse(BmdData, CandidateModel)) continue;
+
+		FString BmdBaseName = FPaths::GetBaseFilename(BmdPath).ToLower();
+		int32 JointCount = CandidateModel.Joints.Num();
+
+		UE_LOG(LogSMSImporter, Log, TEXT("  BMD candidate: %s (%d joints, skinning=%s)"),
+			*BmdPath, JointCount, CandidateModel.bHasSkinning ? TEXT("yes") : TEXT("no"));
+
+		// Prefer: name match > most joints
+		bool bNameMatch = (BmdBaseName == ArchiveBaseName);
+		bool bBestNameMatch = !BestBmdPath.IsEmpty() &&
+			(FPaths::GetBaseFilename(BestBmdPath).ToLower() == ArchiveBaseName);
+
+		if (BestBmdPath.IsEmpty() ||
+			(bNameMatch && !bBestNameMatch) ||
+			(!bBestNameMatch && JointCount > BestJointCount))
+		{
+			BestBmdPath = BmdPath;
+			BestModel = MoveTemp(CandidateModel);
+			BestJointCount = JointCount;
+		}
+	}
+
+	if (BestBmdPath.IsEmpty())
+	{
+		UE_LOG(LogSMSImporter, Error, TEXT("No valid BMD files in character archive: %s"), *Character.ArchivePath);
+		return;
+	}
+
+	UE_LOG(LogSMSImporter, Log, TEXT("Selected BMD: %s (%d joints)"), *BestBmdPath, BestJointCount);
+
+	ReportProgress(ProgressCallback, 0.2f, TEXT("Parsing model..."));
+
+	FBMDModel& Model = BestModel;
+
+	if (bCancelRequested) return;
+
+	ReportProgress(ProgressCallback, 0.4f, TEXT("Creating skeletal mesh..."));
+
+	// Create skeletal mesh if the model has joints (for animation support),
+	// otherwise fall back to static mesh
+	USkeletalMesh* SkelMesh = nullptr;
+	if (Model.Joints.Num() > 1 || Model.bHasSkinning)
+	{
+		SkelMesh = FBMDLoader::CreateSkeletalMesh(GetTransientPackage(),
+			Character.DisplayName, Model, CharAssetPath);
+	}
+	else
+	{
+		// Fall back to static mesh for non-skinned, single-joint models
+		FBMDLoader::CreateStaticMesh(GetTransientPackage(),
+			Character.DisplayName, Model, CharAssetPath);
+		UE_LOG(LogSMSImporter, Log, TEXT("Character '%s' has no skeleton — imported as static mesh"),
+			*Character.DisplayName);
+	}
+
+	if (bCancelRequested) return;
+
+	// Import selected BCK animations
+	if (SkelMesh && SelectedBckFiles.Num() > 0)
+	{
+		USkeleton* Skeleton = SkelMesh->GetSkeleton();
+		int32 AnimIdx = 0;
+		const int32 TotalAnims = SelectedBckFiles.Num();
+
+		for (const FString& BckPath : SelectedBckFiles)
+		{
+			if (bCancelRequested) return;
+
+			float AnimProgress = 0.5f + 0.5f * (static_cast<float>(AnimIdx) / FMath::Max(1, TotalAnims));
+			ReportProgress(ProgressCallback, AnimProgress,
+				FString::Printf(TEXT("Importing animation: %s"), *FPaths::GetBaseFilename(BckPath)));
+
+			TArray<uint8> BckData = Archive.GetFile(BckPath);
+			if (BckData.Num() == 0)
+			{
+				UE_LOG(LogSMSImporter, Warning, TEXT("Failed to read BCK file: %s"), *BckPath);
+				AnimIdx++;
+				continue;
+			}
+
+			FBCKAnimation BckAnim;
+			if (FBCKLoader::Parse(BckData, BckAnim))
+			{
+				FString AnimName = FPaths::GetBaseFilename(BckPath);
+				FBCKLoader::CreateAnimSequence(Skeleton, BckAnim,
+					Model.Joints, Model.JointNames, AnimName, CharAssetPath);
+			}
+			else
+			{
+				UE_LOG(LogSMSImporter, Warning, TEXT("Failed to parse BCK: %s"), *BckPath);
+			}
+
+			AnimIdx++;
+		}
+	}
+
+	ReportProgress(ProgressCallback, 1.0f,
+		FString::Printf(TEXT("Character '%s' import complete"), *Character.DisplayName));
+}
+
+// ---- Progress reporting ----
 
 void FSMSSceneLoader::ReportProgress(const FOnSMSImportProgress& Callback, float Progress, const FString& Message)
 {
